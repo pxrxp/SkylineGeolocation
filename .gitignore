@@ -1,4 +1,7 @@
+__pycache__
 HORAYZON
 data
 .ipynb_checkpoints
 .virtual_documents
+lessons.md
+tmp/
