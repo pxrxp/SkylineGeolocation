@@ -185,7 +185,6 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=1.5, r_til
     
     if r_tilt is not None:
         rays_leveled = r_tilt @ rays_cam_normalized
-        # Correct pyrender space axis extraction: +Y is UP, -Z is FORWARD
         elevations_rad = np.arcsin(np.clip(rays_leveled[1, :], -1.0, 1.0))
         azimuths_rad = np.arctan2(rays_leveled[0, :], -rays_leveled[2, :])
     else:
@@ -198,8 +197,7 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=1.5, r_til
     target_azimuth_grid = np.arange(azimuths_deg[0], azimuths_deg[-1], 0.25)
     calibrated_query_profile = np.interp(target_azimuth_grid, azimuths_deg, elevations_deg)
     
-    return calibrated_query_profile
-
+    return calibrated_query_profile, azimuths_deg[0]
 
 def fft_valid_convolve(signal, kernel):
     """Compute the valid linear convolution using FFT."""
@@ -255,7 +253,7 @@ def _compute_z_norm_corr(padded, q_signal, m, N):
     return corr_norm
 
 
-def run_sliding_fft_for_db(db, query_profile, feature="profile"):
+def run_sliding_fft_for_db(db, query_profile, feature="combined"):
     """
     FFT-accelerated sliding window matching.
     """
@@ -301,7 +299,7 @@ def run_sliding_fft_for_db(db, query_profile, feature="profile"):
             corr_deriv = _compute_z_norm_corr(np.hstack([db_deriv, db_deriv[:m-1]]), q_deriv, m, N)
             corr_curv = _compute_z_norm_corr(np.hstack([db_curv, db_curv[:m-1]]), q_curv, m, N)
 
-            weights = np.array([0.5, 0.35, 0.15], dtype=np.float64)
+            weights = np.array([0.50, 0.35, 0.15], dtype=np.float64)
             corr_norm = weights[0] * corr_raw + weights[1] * corr_deriv + weights[2] * corr_curv
             best_offset = int(np.argmax(corr_norm))
         else:
@@ -313,8 +311,8 @@ def run_sliding_fft_for_db(db, query_profile, feature="profile"):
     return best_corrs, best_offsets
 
 
-def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile,
-                              top_k_candidates=50, dtw_window=20, 
+def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile, start_az,
+                              feature="derivative", top_k_candidates=50, dtw_window=20, 
                               use_tiers=(True, True, True)):
     """
     Two-stage matching: FFT pre-filtering followed by Sakoe-Chiba DTW.
@@ -328,11 +326,11 @@ def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile,
     corr_r, offsets_r = (np.full(num_viewpoints, -np.inf), np.zeros(num_viewpoints, dtype=np.int32))
 
     if use_tiers[0]:
-        corr_g, offsets_g = run_sliding_fft_for_db(db_global, query_profile, feature="derivative")
+        corr_g, offsets_g = run_sliding_fft_for_db(db_global, query_profile, feature=feature)
     if use_tiers[1]:
-        corr_l, offsets_l = run_sliding_fft_for_db(db_local, query_profile, feature="derivative")
+        corr_l, offsets_l = run_sliding_fft_for_db(db_local, query_profile, feature=feature)
     if use_tiers[2]:
-        corr_r, offsets_r = run_sliding_fft_for_db(db_restricted, query_profile, feature="derivative")
+        corr_r, offsets_r = run_sliding_fft_for_db(db_restricted, query_profile, feature=feature)
 
     best_corr_per_viewpoint = np.zeros(num_viewpoints)
     best_offset_per_viewpoint = np.zeros(num_viewpoints, dtype=np.int32)
@@ -350,9 +348,14 @@ def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile,
     
     final_results = []
     dbs = [db_global, db_local, db_restricted]
+    
+    # Scale-invariant normalization
     q_norm = query_profile - np.mean(query_profile)
-    q_deriv = np.gradient(q_norm)
-    q_desc = np.vstack((q_norm, q_deriv)).T
+    q_std = np.std(q_norm) + 1e-12
+    q_norm_scaled = q_norm / q_std
+    q_deriv = np.gradient(q_norm_scaled)
+    q_deriv /= (np.std(q_deriv) + 1e-12)
+    q_desc = np.vstack((q_norm_scaled, q_deriv)).T
     
     for idx in top_candidates:
         winning_tier_idx = best_tier_per_viewpoint[idx]
@@ -361,39 +364,39 @@ def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile,
         
         db_indices = np.arange(offset, offset + m) % N
         matched_db_subsequence = active_db[idx, db_indices]
+        
         db_sub_norm = matched_db_subsequence - np.mean(matched_db_subsequence)
-        db_deriv = np.gradient(db_sub_norm)
-        db_desc = np.vstack((db_sub_norm, db_deriv)).T
+        db_sub_std = np.std(db_sub_norm) + 1e-12
+        db_sub_norm_scaled = db_sub_norm / db_sub_std
+        db_deriv = np.gradient(db_sub_norm_scaled)
+        db_deriv /= (np.std(db_deriv) + 1e-12)
+        db_desc = np.vstack((db_sub_norm_scaled, db_deriv)).T
         
         INF = float('inf')
         dtw_matrix = np.full((m + 1, m + 1), INF)
         dtw_matrix[0, 0] = 0.0
-        best_so_far = float('inf')
 
         for ii in range(1, m + 1):
             col_start = max(1, ii - dtw_window)
             col_end = min(m, ii + dtw_window)
-            row_min = INF
             for jj in range(col_start, col_end + 1):
                 cost = float(np.linalg.norm(q_desc[ii-1] - db_desc[jj-1]))
                 v = min(dtw_matrix[ii-1, jj], dtw_matrix[ii, jj-1], dtw_matrix[ii-1, jj-1])
                 dtw_matrix[ii, jj] = cost + v
-                if dtw_matrix[ii, jj] < row_min:
-                    row_min = dtw_matrix[ii, jj]
-            if row_min > best_so_far:
-                break
+
+        dtw_cost = dtw_matrix[m, m]
+        predicted_heading = (offset * 0.25 - start_az) % 360.0
 
         final_results.append({
             'viewpoint_idx': idx,
             'fft_corr': best_corr_per_viewpoint[idx],
-            'dtw_cost': dtw_matrix[m, m],
-            'heading_deg': offset * 0.25,
+            'dtw_cost': dtw_cost,
+            'heading_deg': predicted_heading,
             'predicted_tier': tier_names[winning_tier_idx]
         })
     
     final_results.sort(key=lambda x: x['dtw_cost'])
     return final_results
-
 
 # ============================================================================
 # MAIN COMMANDS
@@ -451,14 +454,14 @@ def cmd_evaluate(args):
         if r_tilt is not None:
             r_tilt = np.array(r_tilt, dtype=np.float32)
 
-        query_profile = extract_elevation_profile(mask_path, fov_y_deg=fov_y_deg, aspect_ratio=1.5, r_tilt=r_tilt)
+        query_profile, start_az = extract_elevation_profile(mask_path, fov_y_deg=fov_y_deg, aspect_ratio=1.5, r_tilt=r_tilt)
 
         if args.use_fft_only:
-            corr_g, _ = (run_sliding_fft_for_db(db_global, query_profile, feature="derivative")
+            corr_g, _ = (run_sliding_fft_for_db(db_global, query_profile, feature=args.feature)
                          if use_tiers[0] else (np.full(db_global.shape[0], -np.inf), None))
-            corr_l, _ = (run_sliding_fft_for_db(db_local, query_profile, feature="derivative")
+            corr_l, _ = (run_sliding_fft_for_db(db_local, query_profile, feature=args.feature)
                          if use_tiers[1] else (np.full(db_global.shape[0], -np.inf), None))
-            corr_r, _ = (run_sliding_fft_for_db(db_restricted, query_profile, feature="derivative")
+            corr_r, _ = (run_sliding_fft_for_db(db_restricted, query_profile, feature=args.feature)
                          if use_tiers[2] else (np.full(db_global.shape[0], -np.inf), None))
 
             best_corr = np.maximum(np.maximum(corr_g, corr_l), corr_r)
@@ -466,7 +469,8 @@ def cmd_evaluate(args):
             matches = [{'viewpoint_idx': idx} for idx in top_indices[:5]]
         else:
             matches = run_three_tier_search_opt(
-                db_global, db_local, db_restricted, query_profile,
+                db_global, db_local, db_restricted, query_profile, start_az,
+                feature=args.feature,
                 top_k_candidates=args.top_k_candidates,
                 dtw_window=args.dtw_window,
                 use_tiers=use_tiers
@@ -522,7 +526,7 @@ def cmd_diagnose(args):
     if r_tilt is not None:
         r_tilt = np.array(r_tilt, dtype=np.float32)
 
-    query_profile = extract_elevation_profile("data/synthetic_dataset/masks/sample_0000.png", fov_y_deg=fov_y_deg, aspect_ratio=1.5, r_tilt=r_tilt)
+    query_profile, start_az = extract_elevation_profile("data/synthetic_dataset/masks/sample_0000.png", fov_y_deg=fov_y_deg, aspect_ratio=1.5, r_tilt=r_tilt)
     corr_scores_profile, _ = run_sliding_fft_for_db(db_global, query_profile, feature="profile")
     corr_scores_deriv, _ = run_sliding_fft_for_db(db_global, query_profile, feature="derivative")
     corr_scores_combined, _ = run_sliding_fft_for_db(db_global, query_profile, feature="combined")
@@ -555,6 +559,9 @@ if __name__ == "__main__":
     parser.add_argument("--tiers", type=str, default="111")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--use_fft_only", action="store_true")
+    parser.add_argument("--feature", type=str, default="combined", 
+                        choices=["profile", "derivative", "curvature", "combined"],
+                        help="The profile descriptors used for sliding window correlation.")
     
     args = parser.parse_args()
     
