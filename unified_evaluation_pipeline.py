@@ -322,7 +322,7 @@ def run_sliding_fft_for_db(db, query_profile, feature="combined"):
 
 def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile, start_az,
                               feature="derivative", top_k_candidates=50, dtw_window=20, 
-                              use_tiers=(True, True, True)):
+                              use_tiers=(True, True, True), valid_vp_mask=None):
     """
     Two-stage matching: FFT pre-filtering followed by Sakoe-Chiba DTW.
     """
@@ -352,6 +352,9 @@ def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile,
         best_corr_per_viewpoint[i] = scores[best_tier_idx]
         best_offset_per_viewpoint[i] = int(offsets[best_tier_idx])
         best_tier_per_viewpoint[i] = best_tier_idx
+
+    if valid_vp_mask is not None:
+        best_corr_per_viewpoint[~valid_vp_mask] = -np.inf
 
     top_candidates = np.argsort(-best_corr_per_viewpoint)[:top_k_candidates]
     
@@ -439,6 +442,38 @@ def cmd_evaluate(args):
         gt_data = json.load(f)
     viewpoints_mapping = np.load("data/viewpoints_mapping.npy")
     
+    # Load DEM and cache the terrain elevations of all 4,860 database viewpoints
+    print("Preloading DEM for altimetric filtering...")
+    with rasterio.open("data/dem.tif") as src:
+        dem_data = src.read(1).astype(np.float32)
+        [pixel_width, row_rotation, start_x, col_rotation, pixel_height, start_y] = src.transform[:6]
+        raw_xs = start_x + np.arange(src.width) * pixel_width
+        raw_ys = start_y + np.arange(src.height) * pixel_height
+        if pixel_height < 0:
+            raw_ys = raw_ys[::-1]
+            dem_data = np.flipud(dem_data)
+            
+    center_x = raw_xs[len(raw_xs) // 2]
+    center_y = raw_ys[len(raw_ys) // 2]
+    crop_min_x = center_x - DEM_CROP_SIZE_M / 2.0
+    crop_max_x = center_x + DEM_CROP_SIZE_M / 2.0
+    crop_min_y = center_y - DEM_CROP_SIZE_M / 2.0
+    crop_max_y = center_y + DEM_CROP_SIZE_M / 2.0
+    crop_mask_x = (raw_xs >= crop_min_x) & (raw_xs <= crop_max_x)
+    crop_mask_y = (raw_ys >= crop_min_y) & (raw_ys <= crop_max_y)
+    xs_final = raw_xs[crop_mask_x][::2]
+    ys_final = raw_ys[crop_mask_y][::2]
+    dem_data_final = dem_data[crop_mask_y][:, crop_mask_x][::2, ::2]
+    
+    # Cache elevations for all 4,860 viewpoints
+    vp_elevations = np.zeros(viewpoints_mapping.shape[0], dtype=np.float32)
+    for i in range(viewpoints_mapping.shape[0]):
+        vp_x = viewpoints_mapping[i, 2]
+        vp_y = viewpoints_mapping[i, 3]
+        ix = np.clip(np.argmin(np.abs(xs_final - vp_x)), 0, dem_data_final.shape[1] - 1)
+        iy = np.clip(np.argmin(np.abs(ys_final - vp_y)), 0, dem_data_final.shape[0] - 1)
+        vp_elevations[i] = dem_data_final[iy, ix]
+        
     print(f"Preloading database tiers...")
     db_global = np.load("data/horizon_db_global.npy")
     db_local = np.load("data/horizon_db_local.npy")
@@ -462,6 +497,10 @@ def cmd_evaluate(args):
         true_lat, true_lon = gt_info["true_lat"], gt_info["true_lon"]
         fov_y_deg = gt_info.get("fov_y_deg", 65.0)
         
+        # Apply ±50m altimetric constraint
+        gt_ground_z = gt_info["eye_z_m"] - QUERY_MIN_HEIGHT_M
+        valid_vp_mask = np.abs(vp_elevations - gt_ground_z) <= 50.0
+        
         r_tilt = gt_info.get("cam_R_tilt", None)
         if r_tilt is not None:
             r_tilt = np.array(r_tilt, dtype=np.float32)
@@ -477,6 +516,7 @@ def cmd_evaluate(args):
                          if use_tiers[2] else (np.full(db_global.shape[0], -np.inf), None))
 
             best_corr = np.maximum(np.maximum(corr_g, corr_l), corr_r)
+            best_corr[~valid_vp_mask] = -np.inf  # Zeroes out invalid elevations
             top_indices = np.argsort(-best_corr)
             matches = [{'viewpoint_idx': idx} for idx in top_indices[:5]]
         else:
@@ -485,7 +525,8 @@ def cmd_evaluate(args):
                 feature=args.feature,
                 top_k_candidates=args.top_k_candidates,
                 dtw_window=args.dtw_window,
-                use_tiers=use_tiers
+                use_tiers=use_tiers,
+                valid_vp_mask=valid_vp_mask
             )
 
         r1_idx = matches[0]['viewpoint_idx']
