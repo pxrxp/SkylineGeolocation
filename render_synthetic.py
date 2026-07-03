@@ -17,7 +17,7 @@ MASKS_DIR = os.path.join(DATASET_DIR, "masks")
 os.makedirs(IMAGES_DIR, exist_ok=True)
 os.makedirs(MASKS_DIR, exist_ok=True)
 
-TOTAL_SAMPLES = 50
+TOTAL_SAMPLES = 5
 
 print("Loading DEM and detecting georeferencing...")
 with rasterio.open("data/digital_elevation_model/dem.tif") as src:
@@ -182,7 +182,8 @@ def generate_sample_render(sample_id, config):
     final_canvas = Image.fromarray(camera_array_grain)
     final_image_resized = final_canvas.resize((1080, 720), resample=Image.Resampling.LANCZOS)
     
-    binary_mask = (sky_mask * 255).astype(np.uint8)
+    # Adopting GeoPose3K Convention: Sky is 0, Terrain is 255
+    binary_mask = np.where(sky_mask, 0, 255).astype(np.uint8)
     mask_canvas = Image.fromarray(binary_mask)
     final_mask_resized = mask_canvas.resize((1080, 720), resample=Image.Resampling.NEAREST)
     
