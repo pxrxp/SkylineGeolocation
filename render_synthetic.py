@@ -20,7 +20,7 @@ os.makedirs(MASKS_DIR, exist_ok=True)
 TOTAL_SAMPLES = 50
 
 print("Loading DEM and detecting georeferencing...")
-with rasterio.open("data/dem.tif") as src:
+with rasterio.open("data/digital_elevation_model/dem.tif") as src:
     dem_data = src.read(1).astype(np.float32)
     [pixel_width, row_rotation, start_x, col_rotation, pixel_height, start_y] = src.transform[:6]
 
@@ -67,8 +67,8 @@ dem_to_gps = Transformer.from_crs(dem_crs, "EPSG:4326", always_xy=True)
 gps_min_lon, gps_min_lat = dem_to_gps.transform(xs_final[0], ys_final[0])
 gps_max_lon, gps_max_lat = dem_to_gps.transform(xs_final[-1], ys_final[-1])
 
-sat_image = Image.open("data/satellite_texture_cropped.png")
-bounds_data = np.load("data/satellite_texture_bounds_cropped.npz")
+sat_image = Image.open("data/satellite_imagery/satellite_texture_cropped.png")
+bounds_data = np.load("data/satellite_imagery/satellite_texture_bounds_cropped.npz")
 img_min_lat = float(bounds_data['min_lat'])
 img_max_lat = float(bounds_data['max_lat'])
 img_min_lon = float(bounds_data['min_lon'])
@@ -190,7 +190,7 @@ def generate_sample_render(sample_id, config):
 
 print("Beginning procedural generation loop...")
 
-viewpoints_mapping_path = "data/viewpoints_mapping.npy"
+viewpoints_mapping_path = "data/digital_elevation_model/viewpoints_mapping.npy"
 if os.path.exists(viewpoints_mapping_path):
     viewpoints_mapping = np.load(viewpoints_mapping_path)
 else:
@@ -393,7 +393,7 @@ for sample_id in range(TOTAL_SAMPLES):
             import sys
             sys.exit(1)
 
-gt_json_path = "data/synthetic_dataset_gt.json"
+gt_json_path = "data/synthetic_dataset/ground_truth.json"
 with open(gt_json_path, "w") as f:
     json.dump(metadata_dict, f, indent=4)
 
