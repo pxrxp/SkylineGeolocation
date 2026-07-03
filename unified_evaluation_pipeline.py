@@ -372,13 +372,16 @@ def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile,
         db_deriv /= (np.std(db_deriv) + 1e-12)
         db_desc = np.vstack((db_sub_norm_scaled, db_deriv)).T
         
+        # Adaptively scale the warping window based on query sequence length (FOV)
+        adapted_window = max(dtw_window, int(0.08 * m))
+        
         INF = float('inf')
         dtw_matrix = np.full((m + 1, m + 1), INF)
         dtw_matrix[0, 0] = 0.0
 
         for ii in range(1, m + 1):
-            col_start = max(1, ii - dtw_window)
-            col_end = min(m, ii + dtw_window)
+            col_start = max(1, ii - adapted_window)
+            col_end = min(m, ii + adapted_window)
             for jj in range(col_start, col_end + 1):
                 cost = float(np.linalg.norm(q_desc[ii-1] - db_desc[jj-1]))
                 v = min(dtw_matrix[ii-1, jj], dtw_matrix[ii, jj-1], dtw_matrix[ii-1, jj-1])
@@ -498,16 +501,31 @@ def cmd_evaluate(args):
         print("No samples evaluated!")
         return
     
-    top1_acc = 100.0 * top1_correct / len(errors)
-    top5_acc = 100.0 * top5_correct / len(errors)
+    # Replace the final print block of cmd_evaluate with this detailed precision breakdown:
+
+    errors = np.array(errors)
+    total_samples = len(errors)
+    
+    # Calculate success at different precision scales
+    acc_1000 = 100.0 * np.sum(errors <= 1000.0) / total_samples
+    acc_500  = 100.0 * np.sum(errors <= 500.0) / total_samples
+    acc_100  = 100.0 * np.sum(errors <= 100.0) / total_samples
+    acc_10   = 100.0 * np.sum(errors <= 10.0) / total_samples
+    
+    top5_acc = 100.0 * top5_correct / total_samples
     median_err = np.median(errors)
     
     print("\n" + "="*60)
-    print(f"Top-1 Accuracy (1km): {top1_acc:.2f}%")
-    print(f"Top-5 Accuracy (1km): {top5_acc:.2f}%")
-    print(f"Median Error: {median_err:.1f} m")
+    print(f"GEOMETRIC LOCALIZATION PRECISION BREAKDOWN (Total: {total_samples} samples)")
+    print("-"*60)
+    print(f"  Top-1 Accuracy at 1000m (Coarse): {acc_1000:.2f}%")
+    print(f"  Top-1 Accuracy at  500m (Grid):   {acc_500:.2f}%")
+    print(f"  Top-1 Accuracy at  100m (Local):  {acc_100:.2f}%")
+    print(f"  Top-1 Accuracy at   10m (Meter):  {acc_10:.2f}%")
+    print("-"*60)
+    print(f"  Top-5 Accuracy (1000m):           {top5_acc:.2f}%")
+    print(f"  Median Position Error:            {median_err:.1f} m")
     print("="*60)
-
 
 def cmd_diagnose(args):
     print("\n=== Diagnostic: Checking Sample 0 ===")
@@ -554,7 +572,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified evaluation pipeline for visual geo-localization.")
     parser.add_argument("--mode", type=str, default="evaluate", 
                        choices=["build_grid", "build_gt", "evaluate", "diagnose"])
-    parser.add_argument("--top_k_candidates", type=int, default=50)
+    parser.add_argument("--top_k_candidates", type=int, default=150)
     parser.add_argument("--dtw_window", type=int, default=20)
     parser.add_argument("--tiers", type=str, default="111")
     parser.add_argument("--limit", type=int, default=0)
