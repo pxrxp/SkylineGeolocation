@@ -194,10 +194,19 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=1.5, r_til
     azimuths_deg = np.degrees(azimuths_rad)
     elevations_deg = np.degrees(elevations_rad)
     
-    target_azimuth_grid = np.arange(azimuths_deg[0], azimuths_deg[-1], 0.25)
+    # 1. Sort arrays to handle non-monotonicity under pitch/roll rotation
+    sort_idx = np.argsort(azimuths_deg)
+    azimuths_deg = azimuths_deg[sort_idx]
+    elevations_deg = elevations_deg[sort_idx]
+    
+    # 2. Align grid to exact database bin increments (multiples of 0.25) to prevent phase-shift mismatch
+    start_az = np.ceil(azimuths_deg[0] / 0.25) * 0.25
+    end_az = np.floor(azimuths_deg[-1] / 0.25) * 0.25
+    target_azimuth_grid = np.arange(start_az, end_az + 0.01, 0.25)
+    
     calibrated_query_profile = np.interp(target_azimuth_grid, azimuths_deg, elevations_deg)
     
-    return calibrated_query_profile, azimuths_deg[0]
+    return calibrated_query_profile, start_az
 
 def fft_valid_convolve(signal, kernel):
     """Compute the valid linear convolution using FFT."""
