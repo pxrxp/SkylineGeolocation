@@ -496,20 +496,28 @@ def cmd_evaluate(args):
     
     use_tiers = (args.tiers[0] == '1', args.tiers[1] == '1', args.tiers[2] == '1')
     
-    sample_ids = sorted([int(k) for k in gt_data.keys()])
+    # Sort and load keys as strings (handles both hashes and integers)
+    sample_ids = sorted(list(gt_data.keys()))
     if args.limit > 0:
         sample_ids = sample_ids[:args.limit]
     
     top1_correct, top5_correct = 0, 0
     errors = []
-    failed_sample_ids = []  # Track the IDs of failed match attempts
     
     for sample_id in tqdm(sample_ids, desc="Matching"):
-        mask_path = f"data/synthetic_dataset/masks/sample_{sample_id:04d}.png"
+        # 1. Try to load mask directly using key as filename (handles real-world hash IDs)
+        mask_path = os.path.join(args.masks_dir, f"{sample_id}.png")
+        if not os.path.exists(mask_path):
+            # 2. Fallback to integer formatting for legacy synthetic compatibility
+            try:
+                mask_path = os.path.join(args.masks_dir, f"sample_{int(sample_id):04d}.png")
+            except ValueError:
+                continue
+                
         if not os.path.exists(mask_path):
             continue
 
-        gt_info = gt_data[str(sample_id)]
+        gt_info = gt_data[sample_id]
         true_lat, true_lon = gt_info["true_lat"], gt_info["true_lon"]
         fov_y_deg = gt_info.get("fov_y_deg", 65.0)
         
@@ -668,16 +676,28 @@ def cmd_visualize(args):
     db_local = np.load(db_local_path)
 
     sample_key = str(args.sample_id)
+    # Check for direct key match, or fallback to integer formatting for visualizer arg
     if sample_key not in gt_data:
-        print(f"Error: Sample ID {args.sample_id} not found in ground truth dataset.")
-        return
+        try:
+            sample_key = list(gt_data.keys())[args.sample_id]
+        except IndexError:
+            print(f"Error: Sample identifier {args.sample_id} not found in dataset.")
+            return
 
     gt_info = gt_data[sample_key]
     true_idx = gt_info["closest_viewpoint_id"]
     fov_y_deg = gt_info.get("fov_y_deg", 65.0)
 
-    image_path = f"data/synthetic_dataset/images/sample_{args.sample_id:04d}.png"
-    mask_path = f"data/synthetic_dataset/masks/sample_{args.sample_id:04d}.png"
+    # Resolve paths dynamically
+    image_path = os.path.join(args.images_dir, f"{sample_key}.png")
+    mask_path = os.path.join(args.masks_dir, f"{sample_key}.png")
+    
+    if not os.path.exists(mask_path):
+        try:
+            image_path = os.path.join(args.images_dir, f"sample_{int(sample_key):04d}.png")
+            mask_path = os.path.join(args.masks_dir, f"sample_{int(sample_key):04d}.png")
+        except ValueError:
+            pass
 
     r_tilt = gt_info.get("cam_R_tilt", None)
     if r_tilt is not None:
@@ -747,6 +767,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified evaluation pipeline for visual geo-localization.")
     parser.add_argument("--mode", type=str, default="evaluate", 
                        choices=["build_grid", "build_gt", "evaluate", "diagnose", "visualize"])
+    parser.add_argument("--metadata_path", type=str, default="data/synthetic_dataset_gt.json",
+                        help="Path to the dataset JSON metadata file.")
+    parser.add_argument("--masks_dir", type=str, default="data/synthetic_dataset/masks",
+                        help="Directory containing the segmented horizon masks.")
+    parser.add_argument("--images_dir", type=str, default="data/synthetic_dataset/images",
+                        help="Directory containing the query images.")
     parser.add_argument("--top_k_candidates", type=int, default=30)
     parser.add_argument("--dtw_window", type=int, default=8)
     parser.add_argument("--tiers", type=str, default="010")
