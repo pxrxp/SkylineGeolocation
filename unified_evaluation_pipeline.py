@@ -200,9 +200,10 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=1.5, r_til
         elevations_rad = np.arcsin(np.clip(rays_leveled[1, :], -1.0, 1.0))
         azimuths_rad = np.arctan2(rays_leveled[0, :], -rays_leveled[2, :])
     else:
-        elevations_rad = np.arctan(y_vals)
-        azimuths_rad = np.arctan(x_vals)
-    
+        # Use exact camera-space spherical projection to prevent edge distortion
+        elevations_rad = np.arcsin(np.clip(rays_cam_normalized[1, :], -1.0, 1.0))
+        azimuths_rad = np.arctan2(rays_cam_normalized[0, :], -rays_cam_normalized[2, :])    
+
     azimuths_deg = np.degrees(azimuths_rad)
     elevations_deg = np.degrees(elevations_rad)
     
@@ -264,7 +265,7 @@ def _compute_z_norm_corr(padded, q_signal, m, N):
     sum_t2 = cumsum_sq[m:] - cumsum_sq[:-m]
 
     window_vars = np.maximum(sum_t2[:N] - m * (window_means[:N] ** 2), 0.0)
-    window_stds = np.sqrt(window_vars)
+    window_stds = np.sqrt(window_vars + 0.05)
     
     q_std = 1.0
     denom = np.sqrt(m) * window_stds * q_std + 1e-12
@@ -501,6 +502,7 @@ def cmd_evaluate(args):
     
     top1_correct, top5_correct = 0, 0
     errors = []
+    failed_sample_ids = []  # Track the IDs of failed match attempts
     
     for sample_id in tqdm(sample_ids, desc="Matching"):
         mask_path = f"data/synthetic_dataset/masks/sample_{sample_id:04d}.png"
@@ -558,6 +560,8 @@ def cmd_evaluate(args):
 
         if r1_error <= 1000.0:
             top1_correct += 1
+        else:
+            failed_sample_ids.append(sample_id)  # Record failed ID
 
         in_top5 = False
         for m in matches[:5]:
@@ -587,6 +591,8 @@ def cmd_evaluate(args):
     
     print("\n" + "="*60)
     print(f"GEOMETRIC LOCALIZATION PRECISION BREAKDOWN (Total: {total_samples} samples)")
+    print("-"*60)
+    print(f"Failed Sample IDs (Error > 1km): {failed_sample_ids}")
     print("-"*60)
     print(f"  Top-1 Accuracy at 1000m (Coarse): {acc_1000:.2f}%")
     print(f"  Top-1 Accuracy at  500m (Grid):   {acc_500:.2f}%")
