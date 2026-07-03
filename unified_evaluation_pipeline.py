@@ -407,7 +407,7 @@ def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile,
             'predicted_tier': tier_names[winning_tier_idx]
         })
     
-    final_results.sort(key=lambda x: x['dtw_cost'])
+    final_results.sort(key=lambda x: x['dtw_cost'] / max(0.01, x['fft_corr']))
     return final_results
 
 # ============================================================================
