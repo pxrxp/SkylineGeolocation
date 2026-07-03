@@ -168,6 +168,18 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=1.5, r_til
             skyline_pixels[col] = terrain_indices[0]
         else:
             skyline_pixels[col] = H - 1
+
+    # Apply Gaussian filter with edge-padding to prevent zero-padding boundary distortion
+    sigma = 1.0
+    size = int(2 * np.ceil(3 * sigma) + 1)
+    x_kernel = np.arange(-size // 2 + 1, size // 2 + 1)
+    kernel = np.exp(-x_kernel**2 / (2 * sigma**2))
+    kernel /= kernel.sum()
+    
+    # Pad edges with the boundary values, convolve, and return valid overlap
+    pad_width = size // 2
+    padded_pixels = np.pad(skyline_pixels, pad_width, mode='edge')
+    skyline_pixels = np.convolve(padded_pixels, kernel, mode='valid')
     
     x_c, y_c = W / 2.0, H / 2.0
     horizontal_fov_deg = vertical_to_horizontal_fov(fov_y_deg, aspect_ratio=aspect_ratio)
@@ -262,7 +274,7 @@ def _compute_z_norm_corr(padded, q_signal, m, N):
     return corr_norm
 
 
-def run_sliding_fft_for_db(db, query_profile, feature="combined"):
+def run_sliding_fft_for_db(db, query_profile, feature="combined", expected_offset=None, tolerance_bins=None):
     """
     FFT-accelerated sliding window matching.
     """
@@ -280,25 +292,19 @@ def run_sliding_fft_for_db(db, query_profile, feature="combined"):
         if feature == "profile":
             db_signal = profile
             q_signal = q_norm
-
             padded = np.hstack([db_signal, db_signal[:m-1]])
             corr_norm = _compute_z_norm_corr(padded, q_signal, m, N)
-            best_offset = int(np.argmax(corr_norm))
         elif feature == "derivative":
             db_signal = 0.5 * (np.roll(profile, -1) - np.roll(profile, 1))
             q_signal = q_deriv
-
             padded = np.hstack([db_signal, db_signal[:m-1]])
             corr_norm = _compute_z_norm_corr(padded, q_signal, m, N)
-            best_offset = int(np.argmax(corr_norm))
         elif feature == "curvature":
             db_deriv = 0.5 * (np.roll(profile, -1) - np.roll(profile, 1))
             db_signal = 0.5 * (np.roll(db_deriv, -1) - np.roll(db_deriv, 1))
             q_signal = q_curv
-
             padded = np.hstack([db_signal, db_signal[:m-1]])
             corr_norm = _compute_z_norm_corr(padded, q_signal, m, N)
-            best_offset = int(np.argmax(corr_norm))
         elif feature == "combined":
             db_raw = profile
             db_deriv = 0.5 * (np.roll(profile, -1) - np.roll(profile, 1))
@@ -310,10 +316,17 @@ def run_sliding_fft_for_db(db, query_profile, feature="combined"):
 
             weights = np.array([0.50, 0.35, 0.15], dtype=np.float64)
             corr_norm = weights[0] * corr_raw + weights[1] * corr_deriv + weights[2] * corr_curv
-            best_offset = int(np.argmax(corr_norm))
         else:
             raise ValueError(f"Unknown feature type: {feature}")
 
+        # Apply Compass Filter: constrain heading search to ±30 degrees
+        if expected_offset is not None and tolerance_bins is not None:
+            offsets_grid = np.arange(N)
+            dist_to_expected = np.minimum((offsets_grid - expected_offset) % N, (expected_offset - offsets_grid) % N)
+            valid_offset_mask = dist_to_expected <= tolerance_bins
+            corr_norm[~valid_offset_mask] = -np.inf
+
+        best_offset = int(np.argmax(corr_norm))
         best_corrs[i] = corr_norm[best_offset]
         best_offsets[i] = best_offset
 
@@ -322,7 +335,8 @@ def run_sliding_fft_for_db(db, query_profile, feature="combined"):
 
 def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile, start_az,
                               feature="derivative", top_k_candidates=50, dtw_window=20, 
-                              use_tiers=(True, True, True), valid_vp_mask=None):
+                              use_tiers=(True, True, True), valid_vp_mask=None,
+                              expected_offset=None, tolerance_bins=None):
     """
     Two-stage matching: FFT pre-filtering followed by Sakoe-Chiba DTW.
     """
@@ -335,11 +349,11 @@ def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile,
     corr_r, offsets_r = (np.full(num_viewpoints, -np.inf), np.zeros(num_viewpoints, dtype=np.int32))
 
     if use_tiers[0]:
-        corr_g, offsets_g = run_sliding_fft_for_db(db_global, query_profile, feature=feature)
+        corr_g, offsets_g = run_sliding_fft_for_db(db_global, query_profile, feature=feature, expected_offset=expected_offset, tolerance_bins=tolerance_bins)
     if use_tiers[1]:
-        corr_l, offsets_l = run_sliding_fft_for_db(db_local, query_profile, feature=feature)
+        corr_l, offsets_l = run_sliding_fft_for_db(db_local, query_profile, feature=feature, expected_offset=expected_offset, tolerance_bins=tolerance_bins)
     if use_tiers[2]:
-        corr_r, offsets_r = run_sliding_fft_for_db(db_restricted, query_profile, feature=feature)
+        corr_r, offsets_r = run_sliding_fft_for_db(db_restricted, query_profile, feature=feature, expected_offset=expected_offset, tolerance_bins=tolerance_bins)
 
     best_corr_per_viewpoint = np.zeros(num_viewpoints)
     best_offset_per_viewpoint = np.zeros(num_viewpoints, dtype=np.int32)
@@ -385,7 +399,7 @@ def run_three_tier_search_opt(db_global, db_local, db_restricted, query_profile,
         db_desc = np.vstack((db_sub_norm_scaled, db_deriv)).T
         
         # Adaptively scale the warping window based on query sequence length (FOV)
-        adapted_window = max(dtw_window, int(0.08 * m))
+        adapted_window = max(dtw_window, int(0.03 * m))
         
         INF = float('inf')
         dtw_matrix = np.full((m + 1, m + 1), INF)
@@ -505,14 +519,26 @@ def cmd_evaluate(args):
         if r_tilt is not None:
             r_tilt = np.array(r_tilt, dtype=np.float32)
 
+        # First extract the profile and define start_az
+        query_profile, start_az = extract_elevation_profile(mask_path, fov_y_deg=fov_y_deg, aspect_ratio=1.5, r_tilt=r_tilt)
+
+        # Now apply the ±30 degree simulated compass constraint (120 bins out of 1440) using start_az
+        true_heading = gt_info["true_heading_deg"]
+        tolerance_bins = int(30.0 / 0.25)
+        expected_offset = int(((true_heading + start_az) % 360.0) / 0.25)        
+
+        r_tilt = gt_info.get("cam_R_tilt", None)
+        if r_tilt is not None:
+            r_tilt = np.array(r_tilt, dtype=np.float32)
+
         query_profile, start_az = extract_elevation_profile(mask_path, fov_y_deg=fov_y_deg, aspect_ratio=1.5, r_tilt=r_tilt)
 
         if args.use_fft_only:
-            corr_g, _ = (run_sliding_fft_for_db(db_global, query_profile, feature=args.feature)
+            corr_g, _ = (run_sliding_fft_for_db(db_global, query_profile, feature=args.feature, expected_offset=expected_offset, tolerance_bins=tolerance_bins)
                          if use_tiers[0] else (np.full(db_global.shape[0], -np.inf), None))
-            corr_l, _ = (run_sliding_fft_for_db(db_local, query_profile, feature=args.feature)
+            corr_l, _ = (run_sliding_fft_for_db(db_local, query_profile, feature=args.feature, expected_offset=expected_offset, tolerance_bins=tolerance_bins)
                          if use_tiers[1] else (np.full(db_global.shape[0], -np.inf), None))
-            corr_r, _ = (run_sliding_fft_for_db(db_restricted, query_profile, feature=args.feature)
+            corr_r, _ = (run_sliding_fft_for_db(db_restricted, query_profile, feature=args.feature, expected_offset=expected_offset, tolerance_bins=tolerance_bins)
                          if use_tiers[2] else (np.full(db_global.shape[0], -np.inf), None))
 
             best_corr = np.maximum(np.maximum(corr_g, corr_l), corr_r)
@@ -526,7 +552,9 @@ def cmd_evaluate(args):
                 top_k_candidates=args.top_k_candidates,
                 dtw_window=args.dtw_window,
                 use_tiers=use_tiers,
-                valid_vp_mask=valid_vp_mask
+                valid_vp_mask=valid_vp_mask,
+                expected_offset=expected_offset,
+                tolerance_bins=tolerance_bins
             )
 
         r1_idx = matches[0]['viewpoint_idx']
@@ -551,8 +579,6 @@ def cmd_evaluate(args):
         print("No samples evaluated!")
         return
     
-    # Replace the final print block of cmd_evaluate with this detailed precision breakdown:
-
     errors = np.array(errors)
     total_samples = len(errors)
     
@@ -622,12 +648,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified evaluation pipeline for visual geo-localization.")
     parser.add_argument("--mode", type=str, default="evaluate", 
                        choices=["build_grid", "build_gt", "evaluate", "diagnose"])
-    parser.add_argument("--top_k_candidates", type=int, default=150)
-    parser.add_argument("--dtw_window", type=int, default=20)
-    parser.add_argument("--tiers", type=str, default="111")
+    parser.add_argument("--top_k_candidates", type=int, default=30)
+    parser.add_argument("--dtw_window", type=int, default=8)
+    parser.add_argument("--tiers", type=str, default="010")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--use_fft_only", action="store_true")
-    parser.add_argument("--feature", type=str, default="combined", 
+    parser.add_argument("--feature", type=str, default="derivative", 
                         choices=["profile", "derivative", "curvature", "combined"],
                         help="The profile descriptors used for sliding window correlation.")
     
