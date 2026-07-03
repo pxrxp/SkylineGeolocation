@@ -479,7 +479,7 @@ def cmd_evaluate(args):
     ys_final = raw_ys[crop_mask_y][::2]
     dem_data_final = dem_data[crop_mask_y][:, crop_mask_x][::2, ::2]
     
-    # Cache elevations for all 4,860 viewpoints
+    # Cache elevations for all viewpoints
     vp_elevations = np.zeros(viewpoints_mapping.shape[0], dtype=np.float32)
     for i in range(viewpoints_mapping.shape[0]):
         vp_x = viewpoints_mapping[i, 2]
@@ -526,12 +526,6 @@ def cmd_evaluate(args):
         true_heading = gt_info["true_heading_deg"]
         tolerance_bins = int(30.0 / 0.25)
         expected_offset = int(((true_heading + start_az) % 360.0) / 0.25)        
-
-        r_tilt = gt_info.get("cam_R_tilt", None)
-        if r_tilt is not None:
-            r_tilt = np.array(r_tilt, dtype=np.float32)
-
-        query_profile, start_az = extract_elevation_profile(mask_path, fov_y_deg=fov_y_deg, aspect_ratio=1.5, r_tilt=r_tilt)
 
         if args.use_fft_only:
             corr_g, _ = (run_sliding_fft_for_db(db_global, query_profile, feature=args.feature, expected_offset=expected_offset, tolerance_bins=tolerance_bins)
@@ -603,6 +597,7 @@ def cmd_evaluate(args):
     print(f"  Median Position Error:            {median_err:.1f} m")
     print("="*60)
 
+
 def cmd_diagnose(args):
     print("\n=== Diagnostic: Checking Sample 0 ===")
     
@@ -644,15 +639,115 @@ def cmd_diagnose(args):
         print(f"  {rank}. Viewpoint {idx}: {dist:.1f}m away {match_quality}")
 
 
+def cmd_visualize(args):
+    print(f"\n=== Visualizing Sample {args.sample_id} ===")
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Error: matplotlib is required for visualization. Install it using: pip install matplotlib")
+        return
+
+    gt_json_path = "data/synthetic_dataset_gt.json"
+    db_local_path = "data/horizon_db_local.npy"
+
+    if not os.path.exists(gt_json_path):
+        print(f"Error: {gt_json_path} not found. Please build ground truth first.")
+        return
+    if not os.path.exists(db_local_path):
+        print(f"Error: {db_local_path} not found.")
+        return
+
+    with open(gt_json_path) as f: 
+        gt_data = json.load(f)
+    db_local = np.load(db_local_path)
+
+    sample_key = str(args.sample_id)
+    if sample_key not in gt_data:
+        print(f"Error: Sample ID {args.sample_id} not found in ground truth dataset.")
+        return
+
+    gt_info = gt_data[sample_key]
+    true_idx = gt_info["closest_viewpoint_id"]
+    fov_y_deg = gt_info.get("fov_y_deg", 65.0)
+
+    image_path = f"data/synthetic_dataset/images/sample_{args.sample_id:04d}.png"
+    mask_path = f"data/synthetic_dataset/masks/sample_{args.sample_id:04d}.png"
+
+    r_tilt = gt_info.get("cam_R_tilt", None)
+    if r_tilt is not None:
+        r_tilt = np.array(r_tilt, dtype=np.float32)
+
+    if not os.path.exists(mask_path):
+        print(f"Error: Mask file {mask_path} not found.")
+        return
+
+    # Extract query profile with correct vertical FOV and tilt compensation
+    query_profile, start_az = extract_elevation_profile(mask_path, fov_y_deg=fov_y_deg, aspect_ratio=1.5, r_tilt=r_tilt)
+
+    # Fetch corresponding database profile
+    db_profile = db_local[true_idx]
+
+    # Plot comparison layout
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+
+    # Panel 1: Rendered image (or fallback text if missing)
+    if os.path.exists(image_path):
+        axes[0].imshow(Image.open(image_path))
+        axes[0].set_title(f"1. Rendered Query Image (Sample {args.sample_id})")
+        axes[0].axis('off')
+    else:
+        axes[0].text(0.5, 0.5, f"Rendered image not found at:\n{image_path}", 
+                     ha='center', va='center', fontsize=12, color='gray')
+        axes[0].set_title(f"1. Rendered Query Image (Sample {args.sample_id} - Missing File)")
+        axes[0].axis('off')
+
+    # Panel 2: Ground-Truth Binary Mask
+    axes[1].imshow(Image.open(mask_path), cmap='gray')
+    axes[1].set_title("2. Ground-Truth Mask (Terrain=0, Sky=255)")
+    axes[1].axis('off')
+
+    # Panel 3: Profile Alignment Check
+    m = len(query_profile)
+    db_padded = np.hstack([db_profile, db_profile[:m-1]])
+    q_norm = (query_profile - np.mean(query_profile)) / (np.std(query_profile) + 1e-12)
+
+    best_r = -1.0
+    best_off = 0
+    for off in range(1440):
+        sub = db_padded[off : off + m]
+        sub_norm = (sub - np.mean(sub)) / (np.std(sub) + 1e-12)
+        r = np.mean(q_norm * sub_norm)
+        if r > best_r:
+            best_r = r
+            best_off = off
+
+    matched_db_subsequence = db_padded[best_off : best_off + m]
+    matched_db_norm = (matched_db_subsequence - np.mean(matched_db_subsequence)) / (np.std(matched_db_subsequence) + 1e-12)
+
+    x_axis = np.arange(m) * 0.25
+    axes[2].plot(x_axis, q_norm, label="Extracted Skyline (Query)", color="crimson", lw=2)
+    axes[2].plot(x_axis, matched_db_norm, label="Database Skyline (DEM Grid Point)", color="royalblue", lw=2, linestyle="--")
+    axes[2].set_title(f"3. Profile Overlay (Pearson Correlation: {best_r:.4f})")
+    axes[2].set_xlabel("Relative Field of View (Degrees)")
+    axes[2].set_ylabel("Normalized Elevation")
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified evaluation pipeline for visual geo-localization.")
     parser.add_argument("--mode", type=str, default="evaluate", 
-                       choices=["build_grid", "build_gt", "evaluate", "diagnose"])
+                       choices=["build_grid", "build_gt", "evaluate", "diagnose", "visualize"])
     parser.add_argument("--top_k_candidates", type=int, default=30)
     parser.add_argument("--dtw_window", type=int, default=8)
     parser.add_argument("--tiers", type=str, default="010")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--use_fft_only", action="store_true")
+    parser.add_argument("--sample_id", type=int, default=0,
+                        help="The index of the sample to process in visualize mode.")
     parser.add_argument("--feature", type=str, default="derivative", 
                         choices=["profile", "derivative", "curvature", "combined"],
                         help="The profile descriptors used for sliding window correlation.")
@@ -667,3 +762,5 @@ if __name__ == "__main__":
         cmd_evaluate(args)
     elif args.mode == "diagnose":
         cmd_diagnose(args)
+    elif args.mode == "visualize":
+        cmd_visualize(args)
