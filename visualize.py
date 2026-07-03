@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+VISUALIZATION SCRIPT - Visual Geo-Localization Alignment Check
+=========================================================================
+"""
+
 import os
 import json
 import numpy as np
@@ -6,7 +12,8 @@ from PIL import Image
 from unified_evaluation_pipeline import extract_elevation_profile
 
 # Load metadata and database
-with open("data/synthetic_dataset_gt.json") as f: gt_data = json.load(f)
+with open("data/synthetic_dataset_gt.json") as f: 
+    gt_data = json.load(f)
 db_local = np.load("data/horizon_db_local.npy")
 
 def vertical_to_horizontal_fov(vertical_fov_deg, aspect_ratio=1.5):
@@ -20,9 +27,12 @@ fov_y_deg = gt_info.get("fov_y_deg", 65.0)
 image_path = f"data/synthetic_dataset/images/sample_{sample_id:04d}.png"
 mask_path = f"data/synthetic_dataset/masks/sample_{sample_id:04d}.png"
 
-# 1. Extract the query profile (ours)
-horizontal_fov_deg = vertical_to_horizontal_fov(fov_y_deg)
-query_profile = extract_elevation_profile(mask_path, horizontal_fov_deg)
+# 1. Extract the query profile (ours) with correct vertical FOV and tilt compensation
+r_tilt = gt_info.get("cam_R_tilt", None)
+if r_tilt is not None:
+    r_tilt = np.array(r_tilt, dtype=np.float32)
+
+query_profile, start_az = extract_elevation_profile(mask_path, fov_y_deg=fov_y_deg, aspect_ratio=1.5, r_tilt=r_tilt)
 
 # 2. Get the database profile (real DEM)
 db_profile = db_local[true_idx]
@@ -72,4 +82,3 @@ axes[2].grid(True, alpha=0.3)
 
 plt.tight_layout()
 plt.show()
-print("Visual alignment check saved as 'alignment_check.png'")
