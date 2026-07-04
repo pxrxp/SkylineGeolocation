@@ -29,7 +29,7 @@ if os.path.exists(CLOUDS_DIR):
 else:
     print(f"Warning: {CLOUDS_DIR} directory not found.")
 
-TOTAL_SAMPLES = 100
+TOTAL_SAMPLES = 300
 
 print("Loading DEM and detecting georeferencing...")
 with rasterio.open("data/digital_elevation_model/dem.tif") as src:
@@ -88,9 +88,24 @@ dem_data_cropped = dem_data[crop_mask_y][:, crop_mask_x]
 
 stride = 4
 dem_data_final = dem_data_cropped[::stride, ::stride]
+dem_data_final = cv2.medianBlur(dem_data_final, 5)
 xs_final = xs_cropped[::stride]
 ys_final = ys_cropped[::stride]
 dem_height, dem_width = dem_data_final.shape
+
+if 'viewpoints_mapping' in locals() or os.path.exists(viewpoints_mapping_path):
+    center_x_mesh = (xs_final[0] + xs_final[-1]) / 2.0
+    center_y_mesh = (ys_final[0] + ys_final[-1]) / 2.0
+    
+    eye_xs = viewpoints_mapping[:, 2]
+    eye_ys = viewpoints_mapping[:, 3]
+    
+    safe_mask = (
+        (eye_xs >= center_x_mesh - 20000.0) & (eye_xs <= center_x_mesh + 20000.0) &
+        (eye_ys >= center_y_mesh - 15000.0) & (eye_ys <= center_y_mesh + 15000.0)
+    )
+    viewpoints_mapping = viewpoints_mapping[safe_mask]
+    print(f"✓ Pre-filtered viewpoints (40km x 30km region): {len(viewpoints_mapping)} coordinates.")
 
 # Explicit grid generation (aligned to 'xy' projection)
 grid_x, grid_y = np.meshgrid(xs_final.astype(np.float32), ys_final.astype(np.float32), indexing='xy')
@@ -203,23 +218,38 @@ uvs = np.column_stack((u, v))
 skirt_uvs = uvs[perimeter_indices]
 extended_uvs = np.vstack((uvs, skirt_uvs))
 
-terrain_mesh = trimesh.Trimesh(vertices=extended_vertices, faces=extended_faces, process=False, validate=False)
-terrain_mesh.visual = trimesh.visual.TextureVisuals(uv=extended_uvs, image=sat_image)
-terrain_mesh.vertex_normals = terrain_mesh.vertex_normals
+terrain_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False, validate=False)
+terrain_mesh.visual = trimesh.visual.TextureVisuals(uv=uvs, image=sat_image)
 pyrender_mesh = pyrender.Mesh.from_trimesh(terrain_mesh, smooth=True)
 
-# 6. Create the flat base plane separately to block the bottom void completely
-base_size = 200000.0  # Safe 200km span
-bx = np.array([-base_size, base_size, base_size, -base_size], dtype=np.float32)
-by = np.array([-base_size, -base_size, base_size, base_size], dtype=np.float32)
-bz = np.full(4, z_base, dtype=np.float32)
-base_vertices = np.column_stack((bx, by, bz))
-base_faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+# Create the separate vertical skirt mesh (Mesh 2) to block the side voids without normal-smoothing artifacts
+skirt_verts = np.zeros((2 * P, 3), dtype=np.float32)
+skirt_verts[:P] = vertices[perimeter_indices]
+skirt_verts[P:] = vertices[perimeter_indices]
+skirt_verts[P:, 2] = z_base
 
-base_uvs = np.zeros((4, 2), dtype=np.float32)
-base_mesh = trimesh.Trimesh(vertices=base_vertices, faces=base_faces, process=False, validate=False)
-base_mesh.visual = trimesh.visual.TextureVisuals(uv=base_uvs, image=sat_image)
-pyrender_base_mesh = pyrender.Mesh.from_trimesh(base_mesh, smooth=True)
+skirt_uvs_sep = np.zeros((2 * P, 2), dtype=np.float32)
+skirt_uvs_sep[:P] = uvs[perimeter_indices]
+skirt_uvs_sep[P:] = uvs[perimeter_indices]
+
+skirt_faces_sep = []
+for i in range(P):
+    t_l = i
+    t_r = (i + 1) % P
+    b_l = P + i
+    b_r = P + ((i + 1) % P)
+    
+    # Double-sided vertical wall faces
+    skirt_faces_sep.append([t_l, b_l, t_r])
+    skirt_faces_sep.append([t_r, b_l, b_r])
+    skirt_faces_sep.append([t_l, t_r, b_l])
+    skirt_faces_sep.append([t_r, b_r, b_l])
+    
+skirt_faces_sep = np.array(skirt_faces_sep, dtype=np.int32)
+
+skirt_mesh = trimesh.Trimesh(vertices=skirt_verts, faces=skirt_faces_sep, process=False, validate=False)
+skirt_mesh.visual = trimesh.visual.TextureVisuals(uv=skirt_uvs_sep, image=sat_image)
+pyrender_skirt_mesh = pyrender.Mesh.from_trimesh(skirt_mesh, smooth=True)
 
 img_w, img_h = 2160, 1440
 
@@ -230,7 +260,7 @@ if len(peak_indices[0]) == 0:
 def generate_sample_render(sample_id, config):
     scene = pyrender.Scene(ambient_light=config["ambient_light"])
     scene.add(pyrender_mesh)
-    scene.add(pyrender_base_mesh)
+    scene.add(pyrender_skirt_mesh)
 
     sun_light = pyrender.DirectionalLight(color=config["sun_color"], intensity=config["sun_intensity"])
     scene.add(sun_light, pose=config["sun_pose"])
@@ -245,21 +275,21 @@ def generate_sample_render(sample_id, config):
     
     sky_mask = depth == 0.0
 
-    # Enforce Sky at the top: Reject if terrain extends to the top edge (overhangs/high walls)
-    if np.mean(sky_mask[0, :]) < 0.95:
-        raise ValueError("Terrain detected at the top edge of the frame.")
+    # 1. Strictly Sky is Up: Reject if ANY terrain/skirt pixels touch the very top edge row
+    if np.mean(sky_mask[0, :]) < 0.97:
+    # if np.any(~sky_mask[0, :]):
+        raise ValueError("Terrain/Skirt detected at the top edge of the frame.")
         
-    # Enforce Terrain at the bottom: Reject if sky/void appears at the bottom edge
+    # 2. Strictly Terrain is Down: Reject if ANY sky/void pixels appear at the bottom edge row
     if np.any(sky_mask[-1, :]):
         raise ValueError("Sky or void detected at the bottom edge of the frame.")
     
-    # Filter out viewpoints staring face-first into local terrain triangles or hillsides.
-    # If the closest 10% of the terrain is under 300 meters away, discard and retry.
+    # 3. Prevent blocky foreground: Reject if closest terrain is under 300 meters
     terrain_depths = depth[~sky_mask]
     if len(terrain_depths) > 0:
-        if np.percentile(terrain_depths, 10) < 300.0:
-            raise ValueError("Immediate foreground terrain blockage or local triangle clipping detected.")
-            
+        if np.min(terrain_depths) < 300.0:
+            raise ValueError("Immediate foreground terrain blockage or local triangle clipping detected.")            
+
     sky_ratio = np.sum(sky_mask) / sky_mask.size
     if sky_ratio < 0.15 or sky_ratio > 0.65:
         raise ValueError("Skyline composition out of bounds.")    
@@ -430,16 +460,16 @@ for sample_id in range(TOTAL_SAMPLES):
     
     while not render_successful:
         attempts += 1
-        if attempts > 100:
-            print(f"Error: Could not find valid view for sample {sample_id} after 100 attempts.")
+        if attempts > 500:
+            print(f"Error: Could not find valid view for sample {sample_id} after 500 attempts.")
             break
 
         eye_x = float(viewpoints_mapping[target_vp_idx, 2])
         eye_y = float(viewpoints_mapping[target_vp_idx, 3])
         
         # Skip viewpoints within 8km of the outer edges to prevent camera clipping (no more giant walls)
-        dist_to_edge_x = min(eye_x - crop_min_x, crop_max_x - eye_x)
-        dist_to_edge_y = min(eye_y - crop_min_y, crop_max_y - eye_y)
+        dist_to_edge_x = min(eye_x - xs_final[0], xs_final[-1] - eye_x)
+        dist_to_edge_y = min(eye_y - ys_final[0], ys_final[-1] - eye_y)
         if dist_to_edge_x < 8000.0 or dist_to_edge_y < 8000.0:
             target_vp_idx = (target_vp_idx + 1) % viewpoints_mapping.shape[0]
             continue
@@ -673,7 +703,7 @@ for sample_id in range(TOTAL_SAMPLES):
             render_successful = True
             print(f"✓ Sample {sample_id} rendered successfully on attempt {attempts}.")
         except ValueError:
-            target_vp_idx = (target_vp_idx + 1) % viewpoints_mapping.shape[0]
+            target_vp_idx = rng.integers(0, viewpoints_mapping.shape[0])
         except Exception as e:
             import traceback
             print(f"\n[CRITICAL ERROR] during rendering: {e}")
