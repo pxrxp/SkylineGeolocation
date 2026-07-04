@@ -163,7 +163,7 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=1.5, r_til
     
     skyline_pixels = np.zeros(W)
     for col in range(W):
-        terrain_indices = np.where(mask[:, col] == 0)[0]
+        terrain_indices = np.where(mask[:, col] == 255)[0]
         if len(terrain_indices) > 0:
             skyline_pixels[col] = terrain_indices[0]
         else:
@@ -729,7 +729,7 @@ def cmd_visualize(args):
 
     # Panel 2: Ground-Truth Binary Mask
     axes[1].imshow(Image.open(mask_path), cmap='gray')
-    axes[1].set_title("2. Ground-Truth Mask (Terrain=0, Sky=255)")
+    axes[1].set_title("2. Ground-Truth Mask (Terrain=255/White, Sky=0/Black)")
     axes[1].axis('off')
 
     # Panel 3: Profile Alignment Check
