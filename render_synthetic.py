@@ -203,7 +203,7 @@ uvs = np.column_stack((u, v))
 skirt_uvs = uvs[perimeter_indices]
 extended_uvs = np.vstack((uvs, skirt_uvs))
 
-terrain_mesh = trimesh.Trimesh(vertices=extended_vertices, faces=extended_faces, process=True, validate=True)
+terrain_mesh = trimesh.Trimesh(vertices=extended_vertices, faces=extended_faces, process=False, validate=False)
 terrain_mesh.visual = trimesh.visual.TextureVisuals(uv=extended_uvs, image=sat_image)
 terrain_mesh.vertex_normals = terrain_mesh.vertex_normals
 pyrender_mesh = pyrender.Mesh.from_trimesh(terrain_mesh, smooth=True)
@@ -244,10 +244,26 @@ def generate_sample_render(sample_id, config):
     renderer.delete()
     
     sky_mask = depth == 0.0
+
+    # Enforce Sky at the top: Reject if terrain extends to the top edge (overhangs/high walls)
+    if np.mean(sky_mask[0, :]) < 0.95:
+        raise ValueError("Terrain detected at the top edge of the frame.")
+        
+    # Enforce Terrain at the bottom: Reject if sky/void appears at the bottom edge
+    if np.any(sky_mask[-1, :]):
+        raise ValueError("Sky or void detected at the bottom edge of the frame.")
+    
+    # Filter out viewpoints staring face-first into local terrain triangles or hillsides.
+    # If the closest 10% of the terrain is under 300 meters away, discard and retry.
+    terrain_depths = depth[~sky_mask]
+    if len(terrain_depths) > 0:
+        if np.percentile(terrain_depths, 10) < 300.0:
+            raise ValueError("Immediate foreground terrain blockage or local triangle clipping detected.")
+            
     sky_ratio = np.sum(sky_mask) / sky_mask.size
     if sky_ratio < 0.15 or sky_ratio > 0.65:
-        raise ValueError("Skyline composition out of bounds.")
-    
+        raise ValueError("Skyline composition out of bounds.")    
+
     y_idx_sky, x_idx_sky = np.indices((img_h, img_w))
     rng = np.random.default_rng(sample_id)
 
@@ -427,16 +443,35 @@ for sample_id in range(TOTAL_SAMPLES):
         if dist_to_edge_x < 8000.0 or dist_to_edge_y < 8000.0:
             target_vp_idx = (target_vp_idx + 1) % viewpoints_mapping.shape[0]
             continue
-        
-        ix = int(np.argmin(np.abs(xs_final - eye_x)))
-        iy = int(np.argmin(np.abs(ys_final - eye_y)))
-        ix = np.clip(ix, 0, dem_width - 1)
-        iy = np.clip(iy, 0, dem_height - 1)
 
-        ground_z = dem_data_final[iy, ix]
+        # Bilinear interpolation of terrain height at (eye_x, eye_y)
+        # to ensure the camera is placed exactly above the actual mesh surface,
+        # completely preventing coordinate-mismatch clipping.
+        dx = xs_final[1] - xs_final[0]
+        dy = ys_final[1] - ys_final[0]
         
-        # Enforce safe clearance height (8.0m) over blocky grid triangles
-        eye_z = ground_z + 8.0 
+        i_frac = (eye_x - xs_final[0]) / dx
+        j_frac = (eye_y - ys_final[0]) / dy
+        
+        i0 = int(np.clip(np.floor(i_frac), 0, dem_width - 2))
+        i1 = i0 + 1
+        j0 = int(np.clip(np.floor(j_frac), 0, dem_height - 2))
+        j1 = j0 + 1
+        
+        tx = np.clip(i_frac - i0, 0.0, 1.0)
+        ty = np.clip(j_frac - j0, 0.0, 1.0)
+        
+        z00 = dem_data_final[j0, i0]
+        z10 = dem_data_final[j0, i1]
+        z01 = dem_data_final[j1, i0]
+        z11 = dem_data_final[j1, i1]
+        
+        ground_z = (1.0 - tx) * (1.0 - ty) * z00 + tx * (1.0 - ty) * z10 + (1.0 - tx) * ty * z01 + tx * ty * z11
+        
+        # Position the camera exactly 1.8m above the terrain to align perfectly with database precomputations.
+        # Any nearby hillside terrain that blocks the frame will naturally trigger the sky composition checks below,
+        # which safely skips the viewpoint and retries.
+        eye_z = ground_z + 1.8
         
         eye = np.array([eye_x, eye_y, eye_z], dtype=np.float32)
         
@@ -638,7 +673,7 @@ for sample_id in range(TOTAL_SAMPLES):
             render_successful = True
             print(f"✓ Sample {sample_id} rendered successfully on attempt {attempts}.")
         except ValueError:
-            pass
+            target_vp_idx = (target_vp_idx + 1) % viewpoints_mapping.shape[0]
         except Exception as e:
             import traceback
             print(f"\n[CRITICAL ERROR] during rendering: {e}")
