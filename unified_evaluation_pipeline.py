@@ -65,7 +65,7 @@ def load_dem_exactly(dem_path="data/digital_elevation_model/dem.tif", viewpoints
         center_x = 478712.0
         center_y = 3086932.0
 
-    crop_size_x, crop_size_y = 110000.0, 110000.0
+    crop_size_x, crop_size_y = 200000.0, 190000.0
     valid_cols = np.any(valid_mask, axis=0)
     valid_rows = np.any(valid_mask, axis=1)
 

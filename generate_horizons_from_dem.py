@@ -127,10 +127,21 @@ def build_viewpoint_grid():
 
 def sample_dem_at_viewpoints(view_xs_ys):
     """
-    Sample DEM elevations at viewpoint locations.
+    Sample DEM elevations at viewpoint locations with nodata-cleaning.
     """
     with rasterio.open(DEM_PATH) as src:
         dem_data = src.read(1).astype(np.float32)
+        
+        # Clean invalid NaN/Inf/Nodata values to prevent camera-in-a-pit artifacts
+        dem_data = np.nan_to_num(dem_data, nan=0.0, posinf=0.0, neginf=0.0)
+        valid_mask = dem_data > 10.0
+        if np.any(valid_mask):
+            min_valid = float(np.min(dem_data[valid_mask]))
+            dem_data[~valid_mask] = min_valid
+        else:
+            dem_data[~valid_mask] = 1000.0
+        dem_data = np.clip(dem_data, 100.0, 9000.0)
+
         [pixel_width, _, start_x, _, pixel_height, start_y] = src.transform[:6]
         raw_ys = start_y + np.arange(src.height) * pixel_height
         
@@ -159,13 +170,23 @@ def sample_dem_at_viewpoints(view_xs_ys):
     
     return viewpoints
 
-
 def build_terrain_mesh():
     """
-    Build HORAYZON terrain mesh from DEM.
+    Build HORAYZON terrain mesh from DEM with nodata-cleaning.
     """
     with rasterio.open(DEM_PATH) as src:
         dem_data = src.read(1).astype(np.float32)
+        
+        # Clean invalid NaN/Inf/Nodata values identically to preserve geometry scale
+        dem_data = np.nan_to_num(dem_data, nan=0.0, posinf=0.0, neginf=0.0)
+        valid_mask = dem_data > 10.0
+        if np.any(valid_mask):
+            min_valid = float(np.min(dem_data[valid_mask]))
+            dem_data[~valid_mask] = min_valid
+        else:
+            dem_data[~valid_mask] = 1000.0
+        dem_data = np.clip(dem_data, 100.0, 9000.0)
+
         [pixel_width, _, start_x, _, pixel_height, start_y] = src.transform[:6]
         
         xs = start_x + np.arange(src.width) * pixel_width
@@ -188,14 +209,13 @@ def build_terrain_mesh():
     
     return vert_grid, height, width, dem_data
 
-
 # ============================================================================
 # RAYCAST HORIZONS
 # ============================================================================
 
 def compute_horizons(vert_grid, height, width, viewpoints, max_search_radius_km):
     """
-    Raycast horizon angles from all viewpoints using HORAYZON.
+    Raycast horizon angles and distances from all viewpoints using HORAYZON.
     """
     num_viewpoints = viewpoints.shape[0]
     
@@ -231,28 +251,33 @@ def compute_horizons(vert_grid, height, width, viewpoints, max_search_radius_km)
         azim_num=NUM_RAYS,
         hori_acc=VERTICAL_ACCURACY,
         ray_org_elev=ray_org_elev,
-        hori_dist_out=False,
+        hori_dist_out=True,          # Enable distance-to-horizon calculations
         elev_ang_low_lim=-89
     )
     
-    # Handle both old (3 return values) and new (2 return values) API
+    # Handle return values (with distances)
     if isinstance(result, tuple):
         if len(result) == 3:
-            horizon_elevation_angles, _, _ = result
+            horizon_elevation_angles, horizon_distances, _ = result
         elif len(result) == 2:
-            horizon_elevation_angles, _ = result
+            horizon_elevation_angles, horizon_distances = result
         else:
             raise ValueError(f"Unexpected number of return values: {len(result)}")
     else:
-        horizon_elevation_angles = result
+        raise TypeError("Expected a tuple of return values when hori_dist_out=True")
     
     elapsed = time.time() - start_time
     print(f"  ✓ Raycast complete in {elapsed:.1f}s")
     
+    # Calculate and print the average visible distance to the horizon
+    avg_distance_km = np.mean(horizon_distances) / 1000.0
+    max_distance_km = np.max(horizon_distances) / 1000.0
+    print(f"  ✓ Average visible distance to horizon: {avg_distance_km:.2f} km")
+    print(f"  ✓ Maximum visible distance to horizon: {max_distance_km:.2f} km")    
+
     horizon_angles = np.degrees(horizon_elevation_angles)
     
     return horizon_angles
-
 
 # ============================================================================
 # MAIN
