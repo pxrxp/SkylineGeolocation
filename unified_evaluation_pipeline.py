@@ -157,14 +157,15 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=None, r_ti
     if aspect_ratio is None:
         aspect_ratio = W / H
     
-    # Auto-detect mask color convention
-    sky_is_white = mask[0, 0] >= 128
+    # Robust region-based sky color convention auto-detection
+    top_rows_mean = np.mean(mask[:10, :])
+    bottom_rows_mean = np.mean(mask[-10:, :])
+    sky_is_white = top_rows_mean > bottom_rows_mean
     
     # Morphological clean to remove isolated noise pixels
     kernel_morph = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    binary_mask = (mask < 128).astype(np.uint8) if sky_is_white else (mask >= 128).astype(np.uint8)
-    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel_morph)
-    
+    binary_mask = (mask < 128).astype(np.uint8) if sky_is_white else (mask >= 128).astype(np.uint8)    
+
     skyline_pixels = np.zeros(W)
     for col in range(W):
         terrain_indices = np.where(binary_mask[:, col] == 1)[0]
