@@ -875,6 +875,8 @@ def cmd_visualize(args):
     axes[2].grid(True, alpha=0.3)
 
     plt.tight_layout()
+    plt.savefig(os.path.join("output", "visualize.png"))
+    print("Saved to output/visualize.png")
     plt.show()
 
 
