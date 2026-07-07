@@ -27,6 +27,7 @@ dependencies:
   - matplotlib
   - pyproj
   - opencv
+  - seaborn
   - dem_stitcher
   - jupyterlab
   - torch
