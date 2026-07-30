@@ -138,9 +138,13 @@ def build_batch_queries(batch_sids, gt_data, masks_dir, bin_deg, n_vp,
         try:
             fov = gt_info.get("fov_y_deg", 65.0)
             r_tilt = np.array(gt_info["cam_R_tilt"]) if gt_info.get("cam_R_tilt") else None
-            profile, azimuth_start = extract_elevation_profile(
+            pr = extract_elevation_profile(
                 mask_path, fov_y_deg=fov, r_tilt=r_tilt, bin_deg=bin_deg
             )
+            if not pr["ok"]:
+                continue
+            profile = pr["profile"]
+            azimuth_start = pr["start_az"]
 
             is_valid, _ = is_profile_applicable(
                 profile, min_std_deg=min_std_deg, min_max_elev_deg=min_max_elev_deg
