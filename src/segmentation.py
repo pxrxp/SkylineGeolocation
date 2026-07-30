@@ -117,6 +117,8 @@ def refine_sky_mask_with_guidance(img_np, raw_unet_mask):
 
 def load_segmentation_model(model_path, device):
     """Loads and returns the trained SMP U-Net model."""
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Segmentation model not found: {model_path}")
     model = smp.Unet(
         encoder_name="tu-mobilenetv3_large_100",
         encoder_weights=None,
@@ -129,34 +131,127 @@ def load_segmentation_model(model_path, device):
     return model.to(device).eval()
 
 
-def segment_image(model, img_path, mask_output_path, device):
-    """Processes a single image, refines it, and saves the resulting sky mask."""
+def _compute_sky_diagnostics(mask, prob_map=None):
+    """Compute quality diagnostics from a binary sky mask and optional probability map."""
+    mask = np.asarray(mask, dtype=np.uint8)
+    H, W = mask.shape
+    total_px = H * W
+
+    sky_ratio = float(mask.sum() / total_px) if total_px > 0 else 0.0
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    largest_sky_area = 0
+    top_connected = False
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area > largest_sky_area:
+            largest_sky_area = area
+        if stats[i, cv2.CC_STAT_TOP] == 0:
+            top_connected = True
+
+    boundary_coverage = 0.0
+    for col in range(W):
+        sky_rows = np.where(mask[:, col] == 1)
+        if len(sky_rows[0]) > 0:
+            boundary_coverage += 1.0
+    boundary_coverage /= max(W, 1)
+
+    mean_confidence = float(prob_map.mean()) if prob_map is not None else None
+
+    return {
+        "sky_ratio": sky_ratio,
+        "largest_sky_area": int(largest_sky_area),
+        "top_connected": top_connected,
+        "boundary_coverage": boundary_coverage,
+        "num_components": int(num_labels - 1),
+        "mean_confidence": mean_confidence,
+    }
+
+
+def segment_image(model, img_path, mask_output_path, device,
+                  min_sky_ratio=0.05, max_sky_ratio=0.95,
+                  min_boundary_coverage=0.5):
+    """Segment sky from a single image, save mask, return status + diagnostics.
+
+    Returns:
+        dict with keys: ok, status, reason, diagnostics, mask_path
+    """
+    if not os.path.exists(img_path):
+        return {
+            "ok": False,
+            "status": "INVALID_INPUT",
+            "reason": f"Image not found: {img_path}",
+            "diagnostics": {},
+            "mask_path": None,
+        }
+
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
-    orig_img = Image.open(img_path).convert("RGB")
+
+    try:
+        orig_img = Image.open(img_path).convert("RGB")
+    except Exception as e:
+        return {
+            "ok": False,
+            "status": "INVALID_INPUT",
+            "reason": f"Cannot open image: {e}",
+            "diagnostics": {},
+            "mask_path": None,
+        }
+
     W, H = orig_img.size
     padded_img, crop_info = _prepare_inference_image(orig_img, input_size=256)
     pad_left, pad_top, resized_width, resized_height = crop_info
-    
-    # 1. Run U-Net inference
+
     tensor_img = transform(Image.fromarray(padded_img)).unsqueeze(0).to(device)
     with torch.no_grad():
         output = torch.sigmoid(model(tensor_img)).squeeze().cpu().numpy()
-        
-    # 2. Remove padding and resize probability map back to the original aspect ratio
+
     output_cropped = output[pad_top:pad_top + resized_height, pad_left:pad_left + resized_width]
     prob_resized = cv2.resize(output_cropped.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
     raw_mask = (prob_resized <= 0.5).astype(np.uint8)
-    
-    # 3. Apply edge guidance and save
+
     refined = refine_sky_mask_with_guidance(np.array(orig_img), raw_mask)
+
+    os.makedirs(os.path.dirname(mask_output_path) or ".", exist_ok=True)
     Image.fromarray(refined).save(mask_output_path)
 
+    diagnostics = _compute_sky_diagnostics(refined, prob_map=prob_resized)
 
-# =============================================================================
+    if diagnostics["sky_ratio"] < min_sky_ratio:
+        return {
+            "ok": False,
+            "status": "LOW_CONFIDENCE",
+            "reason": f"Sky too small (ratio={diagnostics['sky_ratio']:.3f} < {min_sky_ratio})",
+            "diagnostics": diagnostics,
+            "mask_path": mask_output_path,
+        }
+    if diagnostics["sky_ratio"] > max_sky_ratio:
+        return {
+            "ok": False,
+            "status": "LOW_CONFIDENCE",
+            "reason": f"Sky too large (ratio={diagnostics['sky_ratio']:.3f} > {max_sky_ratio})",
+            "diagnostics": diagnostics,
+            "mask_path": mask_output_path,
+        }
+    if diagnostics["boundary_coverage"] < min_boundary_coverage:
+        return {
+            "ok": False,
+            "status": "LOW_CONFIDENCE",
+            "reason": f"Boundary coverage too low ({diagnostics['boundary_coverage']:.3f} < {min_boundary_coverage})",
+            "diagnostics": diagnostics,
+            "mask_path": mask_output_path,
+        }
+
+    return {
+        "ok": True,
+        "status": "OK",
+        "reason": "Clean sky segmentation",
+        "diagnostics": diagnostics,
+        "mask_path": mask_output_path,
+    }# =============================================================================
 # Training utilities
 # =============================================================================
 
