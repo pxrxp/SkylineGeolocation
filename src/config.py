@@ -31,16 +31,16 @@ class PipelineConfig:
 
     # Profile
     fov_y_deg: float = 65.0
-    bin_deg: float = 0.25
+    bin_deg: float = 1.0
     median_kernel: int = 5
 
     # Matching
-    fft_weights: Tuple[float, float, float] = (0.33, 0.33, 0.33)
-    min_corr: float = 0.15
+    fft_weights: Tuple[float, float] = (0.5, 0.5)
+    min_corr: float = 0.30
     min_score_gap: float = 0.03
     top_k: int = 5
     dtw_window: int = 15
-    spatial_stride: int = 5
+    spatial_stride: int = 12
 
     # Evaluation
     chunk_rows: int = 4000

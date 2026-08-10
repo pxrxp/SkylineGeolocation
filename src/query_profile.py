@@ -1,4 +1,5 @@
 """Extracts and validates 1D elevation-angle skyline profiles from terrain masks."""
+
 import numpy as np
 import cv2
 from PIL import Image
@@ -23,13 +24,22 @@ def is_profile_applicable(profile, min_std_deg=1.5, min_max_elev_deg=1.0):
         return False, f"Profile too flat (std={std_val:.2f}° < {min_std_deg}°)"
 
     if max_val < min_max_elev_deg:
-        return False, f"Insufficient terrain relief above horizontal (max={max_val:.2f}° < {min_max_elev_deg}°)"
+        return (
+            False,
+            f"Insufficient terrain relief above horizontal (max={max_val:.2f}° < {min_max_elev_deg}°)",
+        )
 
     return True, "Valid topographic profile"
 
 
-def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=None, r_tilt=None, bin_deg=0.25,
-                              min_boundary_coverage=0.5):
+def extract_elevation_profile(
+    mask_path,
+    fov_y_deg=65.0,
+    aspect_ratio=None,
+    r_tilt=None,
+    bin_deg=0.25,
+    min_boundary_coverage=0.5,
+):
     """
     Translates a binary sky-terrain mask into a 1D elevation-angle profile
     projected onto a uniform azimuth grid.
@@ -37,12 +47,14 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=None, r_ti
     Returns:
         dict with keys: ok, status, reason, profile, start_az, diagnostics
     """
-    if not isinstance(mask_path, str) and not hasattr(mask_path, 'startswith'):
+    if not isinstance(mask_path, str) and not hasattr(mask_path, "startswith"):
         return {
             "ok": False,
             "status": "INVALID_INPUT",
             "reason": "mask_path must be a string path",
-            "profile": None, "start_az": None, "diagnostics": {}
+            "profile": None,
+            "start_az": None,
+            "diagnostics": {},
         }
 
     try:
@@ -53,7 +65,9 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=None, r_ti
             "ok": False,
             "status": "INVALID_INPUT",
             "reason": f"Cannot open mask: {e}",
-            "profile": None, "start_az": None, "diagnostics": {}
+            "profile": None,
+            "start_az": None,
+            "diagnostics": {},
         }
 
     H, W = mask.shape
@@ -62,27 +76,47 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=None, r_ti
             "ok": False,
             "status": "INVALID_INPUT",
             "reason": f"Mask too small ({H}x{W})",
-            "profile": None, "start_az": None, "diagnostics": {"width": W, "height": H}
+            "profile": None,
+            "start_az": None,
+            "diagnostics": {"width": W, "height": H},
         }
 
     aspect_ratio = aspect_ratio or (W / H)
     sky_is_white = np.mean(mask[:10, :]) > np.mean(mask[-10:, :])
-    binary = (mask < 128).astype(np.uint8) if sky_is_white else (mask >= 128).astype(np.uint8)
+    binary = (
+        (mask < 128).astype(np.uint8)
+        if sky_is_white
+        else (mask >= 128).astype(np.uint8)
+    )
 
     sky_ratio = float(binary.sum() / (H * W))
     if sky_ratio == 0.0:
         return {
-            "ok": False, "status": "NO_SKYLINE",
+            "ok": False,
+            "status": "NO_SKYLINE",
             "reason": "No sky pixels found in mask",
-            "profile": None, "start_az": None,
-            "diagnostics": {"width": W, "height": H, "sky_ratio": 0.0, "sky_is_white": bool(sky_is_white)}
+            "profile": None,
+            "start_az": None,
+            "diagnostics": {
+                "width": W,
+                "height": H,
+                "sky_ratio": 0.0,
+                "sky_is_white": bool(sky_is_white),
+            },
         }
     if sky_ratio == 1.0:
         return {
-            "ok": False, "status": "NO_SKYLINE",
+            "ok": False,
+            "status": "NO_SKYLINE",
             "reason": "Mask is all sky, no terrain boundary",
-            "profile": None, "start_az": None,
-            "diagnostics": {"width": W, "height": H, "sky_ratio": 1.0, "sky_is_white": bool(sky_is_white)}
+            "profile": None,
+            "start_az": None,
+            "diagnostics": {
+                "width": W,
+                "height": H,
+                "sky_ratio": 1.0,
+                "sky_is_white": bool(sky_is_white),
+            },
         }
 
     skyline_px = np.full(W, H - 1, dtype=np.float32)
@@ -98,19 +132,28 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=None, r_ti
     boundary_coverage = 1.0 - (missing_cols / W)
     skyline_px = ndimage.median_filter(skyline_px, size=5)
 
-    hfov_deg = np.degrees(2.0 * np.arctan(np.tan(np.radians(fov_y_deg) / 2.0) * aspect_ratio))
+    hfov_deg = np.degrees(
+        2.0 * np.arctan(np.tan(np.radians(fov_y_deg) / 2.0) * aspect_ratio)
+    )
     focal_x = W / (2.0 * np.tan(np.radians(hfov_deg) / 2.0))
     focal_y = H / (2.0 * np.tan(np.radians(fov_y_deg) / 2.0))
     x_c, y_c = W / 2.0, H / 2.0
     cols = np.arange(W)
-    rays = np.vstack([(cols - x_c) / focal_x, (y_c - skyline_px) / focal_y, -np.ones(W)])
+    rays = np.vstack(
+        [(cols - x_c) / focal_x, (y_c - skyline_px) / focal_y, -np.ones(W)]
+    )
     rays /= np.linalg.norm(rays, axis=0)
+
+    # Azimuth from the camera frame (forward = -z), before any tilt rotation.
+    # This keeps start_az in a stable camera-relative range regardless of pitch,
+    # so the expected-offset convention (heading + start_az) stays valid.
+    azim_cam = np.degrees(np.arctan2(rays[0, :], -rays[2, :]))
 
     if r_tilt is not None:
         rays = np.asarray(r_tilt) @ rays
 
     elev_deg = np.degrees(np.arcsin(np.clip(rays[1, :], -1.0, 1.0)))
-    azim_deg = np.degrees(np.arctan2(rays[0, :], -rays[2, :]))
+    azim_deg = azim_cam
 
     order = np.argsort(azim_deg)
     azim_deg, elev_deg = azim_deg[order], elev_deg[order]
@@ -121,7 +164,8 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=None, r_ti
     profile = np.interp(grid, azim_deg, elev_deg)
 
     diagnostics = {
-        "width": W, "height": H,
+        "width": W,
+        "height": H,
         "sky_ratio": sky_ratio,
         "sky_is_white": bool(sky_is_white),
         "boundary_coverage": float(boundary_coverage),
@@ -137,24 +181,30 @@ def extract_elevation_profile(mask_path, fov_y_deg=65.0, aspect_ratio=None, r_ti
 
     if boundary_coverage < min_boundary_coverage:
         return {
-            "ok": False, "status": "LOW_CONFIDENCE",
+            "ok": False,
+            "status": "LOW_CONFIDENCE",
             "reason": f"Boundary coverage too low ({boundary_coverage:.3f} < {min_boundary_coverage})",
-            "profile": profile, "start_az": float(start_az),
+            "profile": profile,
+            "start_az": float(start_az),
             "diagnostics": diagnostics,
         }
 
     applicable, msg = is_profile_applicable(profile)
     if not applicable:
         return {
-            "ok": False, "status": "LOW_CONFIDENCE",
+            "ok": False,
+            "status": "LOW_CONFIDENCE",
             "reason": msg,
-            "profile": profile, "start_az": float(start_az),
+            "profile": profile,
+            "start_az": float(start_az),
             "diagnostics": diagnostics,
         }
 
     return {
-        "ok": True, "status": "OK",
+        "ok": True,
+        "status": "OK",
         "reason": "Valid profile extracted",
-        "profile": profile, "start_az": float(start_az),
+        "profile": profile,
+        "start_az": float(start_az),
         "diagnostics": diagnostics,
     }

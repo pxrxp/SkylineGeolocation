@@ -10,7 +10,12 @@ import pyarrow.parquet as pq
 from geopy.distance import geodesic
 from tqdm.auto import tqdm
 
-from src.matching import fft_prefilter, finalize_matches
+from src.matching import (
+    fft_prefilter,
+    finalize_matches,
+    feature_bundle_matrix,
+    ncc_scores,
+)
 
 
 def _stream_horizon_chunks(parquet_path, chunk_rows=4000):
@@ -84,6 +89,9 @@ class _RowView:
     def items(self):
         return sorted(self.rows, key=lambda x: -x[0])
 
+    def __iter__(self):
+        return iter(self.items())
+
 
 def load_ground_truth(ground_truth_path, limit=0):
     """Load ground-truth metadata and apply optional sample limit."""
@@ -123,19 +131,31 @@ def filter_samples_with_masks(sample_ids, masks_dir):
     """Keep only sample IDs that have an existing predicted mask image."""
     valid_sids = []
     for sid in sample_ids:
-        mask_path_fixed = os.path.join(masks_dir, f"sample_{int(sid):04d}.png")
         mask_path_raw = os.path.join(masks_dir, f"{sid}.png")
-        if os.path.exists(mask_path_fixed) or os.path.exists(mask_path_raw):
+        if os.path.exists(mask_path_raw):
             valid_sids.append(sid)
+            continue
+        try:
+            mask_path_fixed = os.path.join(masks_dir, f"sample_{int(sid):04d}.png")
+            if os.path.exists(mask_path_fixed):
+                valid_sids.append(sid)
+        except (ValueError, TypeError):
+            pass
     return valid_sids
 
 
 def _resolve_mask_path(masks_dir, sample_id):
     """Return whichever naming convention exists for the sample mask."""
-    mask_path = os.path.join(masks_dir, f"sample_{int(sample_id):04d}.png")
-    if not os.path.exists(mask_path):
-        mask_path = os.path.join(masks_dir, f"{sample_id}.png")
-    return mask_path
+    mask_path_raw = os.path.join(masks_dir, f"{sample_id}.png")
+    if os.path.exists(mask_path_raw):
+        return mask_path_raw
+    try:
+        mask_path_fixed = os.path.join(masks_dir, f"sample_{int(sample_id):04d}.png")
+        if os.path.exists(mask_path_fixed):
+            return mask_path_fixed
+    except (ValueError, TypeError):
+        pass
+    return mask_path_raw
 
 
 def build_batch_queries(
@@ -202,8 +222,8 @@ def run_batch_coarse_scan(
     elev_m,
     n_vp,
     chunk_rows=4000,
-    spatial_stride=5,
-    weights=(0.33, 0.33, 0.33),
+    spatial_stride=12,
+    weights=(0.5, 0.5),
     compass_tolerance_deg=20.0,
     height_tolerance_m=200.0,
     progress_desc="Scanning DB",
@@ -223,9 +243,14 @@ def run_batch_coarse_scan(
         stride_matrix = chunk_matrix[stride_indices]
         stride_elevations = chunk_elevations[stride_indices]
 
+        # DB features are shared across all queries in the batch
+        db_val, db_d1 = feature_bundle_matrix(stride_matrix)
+        global_stride_indices = np.arange(chunk_start, chunk_end, spatial_stride)
+
         for query_state in batch_queries.values():
-            corr_scores, offsets = fft_prefilter(
-                stride_matrix,
+            corr_scores, offsets = ncc_scores(
+                db_val,
+                db_d1,
                 query_state["profile"],
                 bin_deg,
                 weights=weights,
@@ -240,15 +265,12 @@ def run_batch_coarse_scan(
                 )
                 corr_scores = np.where(elevation_valid, corr_scores, -np.inf)
 
-            global_stride_indices = np.arange(chunk_start, chunk_end, spatial_stride)
-            current_best = query_state["best_corr"][global_stride_indices]
-            is_better = corr_scores > current_best
+            is_better = corr_scores > query_state["best_corr"][global_stride_indices]
 
             if np.any(is_better):
-                current_best[is_better] = corr_scores[is_better]
-                query_state["best_offset"][global_stride_indices[is_better]] = offsets[
-                    is_better
-                ]
+                vp_indices = global_stride_indices[is_better]
+                query_state["best_corr"][vp_indices] = corr_scores[is_better]
+                query_state["best_offset"][vp_indices] = offsets[is_better]
 
         del chunk_matrix
         gc.collect()
@@ -382,12 +404,12 @@ def run_evaluation(
     use_compass=True,
     compass_tolerance_deg=20.0,
     bbox=None,
-    weights=(0.33, 0.33, 0.33),
+    weights=(0.5, 0.5),
     min_std_deg=1.5,
     min_max_elev_deg=1.0,
     chunk_rows=4000,
     sample_batch_size=8,
-    spatial_stride=5,
+    spatial_stride=12,
     checkpoint_dir=None,
 ):
     """Backward-compatible orchestrator with optional batch-level checkpointing."""
@@ -483,7 +505,39 @@ def run_evaluation(
 
 
 # Simple helper import needed by the evaluator
+# Simple helper import needed by the evaluator
 from src.query_profile import extract_elevation_profile, is_profile_applicable
+
+
+def _merge_topk(
+    running_corr,
+    running_idx,
+    running_offset,
+    chunk_corr,
+    chunk_offset,
+    local_indices,
+    k,
+):
+    """Merge chunk scores into a running top-K (small bounded arrays)."""
+    n_running = len(running_corr)
+    if n_running == 0:
+        take = min(k, len(chunk_corr))
+        order = np.argpartition(chunk_corr, -take)[-take:]
+        return (
+            chunk_corr[order].astype(np.float32),
+            local_indices[order],
+            chunk_offset[order].astype(np.int32),
+        )
+    combined_corr = np.concatenate([running_corr, chunk_corr])
+    combined_idx = np.concatenate([running_idx, local_indices])
+    combined_off = np.concatenate([running_offset, chunk_offset])
+    take = min(k, len(combined_corr))
+    order = np.argpartition(combined_corr, -take)[-take:]
+    return (
+        combined_corr[order].astype(np.float32),
+        combined_idx[order],
+        combined_off[order].astype(np.int32),
+    )
 
 
 def run_parameter_sweep(
@@ -495,23 +549,25 @@ def run_parameter_sweep(
     min_std_deg=1.5,
     min_max_elev_deg=1.0,
     chunk_rows=4000,
-    spatial_stride=5,
+    spatial_stride=12,
     sample_batch_size=8,
     thresholds_m=None,
+    top_k_candidates=200,
 ):
-    """Single-DB-pass parameter sweep.
+    """Memory-safe single-DB-pass parameter sweep.
 
-    Streams DB once, collects raw coarse scores for each query, then applies
-    per-config filtering + DTW refinement. Saves ~Nx speedup vs. running
-    `run_evaluation` separately for each config.
+    Streams the DB once per query batch and keeps only a bounded top-K
+    candidate list per (config, query), so RAM stays ~chunk-size regardless of
+    DB size or number of configs.
 
     Parameters
     ----------
     configs : dict[str, dict]
-        Each key is a config name; value is a dict of overrides passed to
-        `build_batch_queries` and `refine_query_with_dtw`.  Recognised keys:
-          use_altimeter, use_compass, compass_tolerance_deg, height_tolerance_m,
-          dtw_window, spatial_stride, weights, top_k, correct_dist_m.
+        Key = config name; value = dict of overrides. Recognised keys:
+        use_altimeter, use_compass, compass_tolerance_deg, height_tolerance_m,
+        dtw_window, spatial_stride, weights, top_k, correct_dist_m.
+    top_k_candidates : int
+        How many coarse candidates to keep per (config, query) before DTW.
     """
     if thresholds_m is None:
         thresholds_m = [50.0, 100.0, 200.0, 500.0, 1000.0]
@@ -524,9 +580,8 @@ def run_parameter_sweep(
     if not valid_sids:
         return {}, {}
 
-    # --- Phase 1: extract profiles and initial query states ---
-    query_profiles = {}  # sid → profile array
-    query_gt_info = {}  # sid → gt dict
+    # --- Phase 1: extract profiles once (cheap, small) ---
+    queries = {}  # sid → {profile, gt_info, start_az}
     for sid in valid_sids:
         gt_info = gt_data[sid]
         mask_path = _resolve_mask_path(masks_dir, sid)
@@ -543,143 +598,145 @@ def run_parameter_sweep(
         )
         if not is_valid:
             continue
-        query_profiles[sid] = profile
-        query_gt_info[sid] = gt_info
+        queries[sid] = {
+            "profile": profile,
+            "gt_info": gt_info,
+            "start_az": pr["start_az"],
+        }
 
-    valid_sids = list(query_profiles.keys())
-    print(f"[Sweep] {len(valid_sids)} valid queries from {len(sample_ids)} total")
+    if not queries:
+        return {}, {}
+    print(f"[Sweep] {len(queries)} valid queries, {len(configs)} configs", flush=True)
 
-    # --- Phase 2: single-pass DB scan — collect raw FFT scores per query ---
-    raw_scores = {}  # sid → {vp_idx: (corr, offset)}
-    for sid in valid_sids:
-        raw_scores[sid] = {}
+    # Precompute per-config metadata
+    cfg_meta = {}
+    for cfg_name, cfg in configs.items():
+        cfg_meta[cfg_name] = {
+            "use_altimeter": cfg.get("use_altimeter", True),
+            "use_compass": cfg.get("use_compass", True),
+            "compass_tolerance_deg": cfg.get("compass_tolerance_deg", 20.0),
+            "height_tolerance_m": cfg.get("height_tolerance_m", 200.0),
+            "dtw_window": cfg.get("dtw_window", 15),
+            "spatial_stride": cfg.get("spatial_stride", spatial_stride),
+            "weights": cfg.get("weights", (0.5, 0.5)),
+            "correct_dist_m": cfg.get("correct_dist_m", 500.0),
+            "top_k": cfg.get("top_k", 30),
+        }
 
-    profile_length = len(next(iter(query_profiles.values())))
-    total_chunks = max(1, n_vp // chunk_rows + 1)
-    chunk_t0 = time.time()
+    # Phase 2: batch queries; stream DB once per batch; update top-K heaps
+    total_batches = max(1, (len(queries) + sample_batch_size - 1) // sample_batch_size)
+    topk_state = {}
+    for cfg_name in configs:
+        topk_state[cfg_name] = {
+            sid: (np.zeros(0, np.float32), np.zeros(0, np.int64), np.zeros(0, np.int32))
+            for sid in queries
+        }
 
-    pf = pq.ParquetFile(db_path)
-    global_offset = 0
-    for chunk_id, batch in enumerate(
-        pf.iter_batches(batch_size=chunk_rows, columns=["raw_horizon_deg"])
-    ):
-        df_batch = batch.to_pandas()
-        chunk_matrix = np.stack(df_batch["raw_horizon_deg"].to_numpy()).astype(
-            np.float32
+    t_start = time.time()
+    sid_list = list(queries.keys())
+
+    for b_i in range(0, len(sid_list), sample_batch_size):
+        batch_sids = sid_list[b_i : b_i + sample_batch_size]
+        batch_meta = {sid: queries[sid] for sid in batch_sids}
+        print(
+            f"\n[Sweep] Batch {b_i // sample_batch_size + 1}/{total_batches} "
+            f"({len(batch_sids)} queries)",
+            flush=True,
         )
-        chunk_size = len(df_batch)
-        chunk_end = global_offset + chunk_size
 
-        for sid, profile in query_profiles.items():
-            corr, offsets = fft_prefilter(
-                chunk_matrix,
-                profile,
-                bin_deg,
-                weights=(0.33, 0.33, 0.33),  # raw scores, no filtering yet
+        pf = pq.ParquetFile(db_path)
+        global_offset = 0
+        for chunk_id, batch in enumerate(
+            pf.iter_batches(batch_size=chunk_rows, columns=["raw_horizon_deg"])
+        ):
+            df_batch = batch.to_pandas()
+            chunk_matrix = np.stack(df_batch["raw_horizon_deg"].to_numpy()).astype(
+                np.float32
             )
-            for i in range(chunk_size):
-                vp_idx = global_offset + i
-                raw_scores[sid][vp_idx] = (float(corr[i]), int(offsets[i]))
+            chunk_size = len(df_batch)
+            # Shared DB features per chunk
+            db_val, db_d1 = feature_bundle_matrix(chunk_matrix)
+            local_indices = np.arange(
+                global_offset, global_offset + chunk_size, dtype=np.int64
+            )
+            chunk_elev = elev_m[global_offset : global_offset + chunk_size]
 
-        del chunk_matrix
+            for sid in batch_sids:
+                q = batch_meta[sid]
+                profile = q["profile"]
+                gt_info = q["gt_info"]
+                corr, offsets = ncc_scores(
+                    db_val, db_d1, profile, bin_deg, weights=(0.5, 0.5)
+                )
+                exp_off = None
+                if "true_heading_deg" in gt_info:
+                    exp_off = (gt_info["true_heading_deg"] + q["start_az"]) % 360.0
+
+                for cfg_name, meta in cfg_meta.items():
+                    gate = np.ones(chunk_size, dtype=bool)
+                    if meta["use_compass"] and exp_off is not None:
+                        bin_off = offsets.astype(np.float64) * bin_deg
+                        diff = np.abs(((bin_off - exp_off + 180.0) % 360.0) - 180.0)
+                        gate &= diff <= meta["compass_tolerance_deg"]
+                    if meta["use_altimeter"] and "eye_z_m" in gt_info:
+                        gt_elev = gt_info["eye_z_m"] - gt_info.get(
+                            "query_height_m", 1.8
+                        )
+                        gate &= (
+                            np.abs(chunk_elev - gt_elev) <= meta["height_tolerance_m"]
+                        )
+
+                    if np.any(gate):
+                        gated_corr = np.where(gate, corr, -np.inf)
+                        run_corr, run_idx, run_off = topk_state[cfg_name][sid]
+                        topk_state[cfg_name][sid] = _merge_topk(
+                            run_corr,
+                            run_idx,
+                            run_off,
+                            gated_corr,
+                            offsets,
+                            local_indices,
+                            k=top_k_candidates,
+                        )
+
+            del chunk_matrix
+            gc.collect()
+
+            if (chunk_id + 1) % 100 == 0:
+                elapsed = time.time() - t_start
+                print(
+                    f"  DB pass: chunk {chunk_id + 1}, elapsed {elapsed:.0f}s",
+                    flush=True,
+                )
+
+        del pf
         gc.collect()
-        global_offset = chunk_end
 
-        if (chunk_id + 1) % 50 == 0 or chunk_id == total_chunks - 1:
-            elapsed = time.time() - chunk_t0
-            print(
-                f"  DB pass: {chunk_id + 1}/{total_chunks} chunks, "
-                f"{elapsed:.0f}s elapsed",
-                flush=True,
-            )
-
-    # --- Phase 3: for each config, filter + DTW ---
+    # --- Phase 3: DTW on top-K candidates for each config ---
     all_summaries = {}
     all_dfs = {}
     for cfg_name, cfg in configs.items():
-        print(f"\n[Sweep] Evaluating: {cfg_name}", flush=True)
+        print(f"\n[Sweep] Refining (DTW): {cfg_name}", flush=True)
+        meta = cfg_meta[cfg_name]
         cfg_results = []
-        use_alt = cfg.get("use_altimeter", True)
-        use_cmp = cfg.get("use_compass", True)
-        compass_tol = cfg.get("compass_tolerance_deg", 20.0)
-        height_tol = cfg.get("height_tolerance_m", 200.0)
-        dtw_w = cfg.get("dtw_window", 15)
-        sp_stride = cfg.get("spatial_stride", 5)
-        wts = cfg.get("weights", (0.33, 0.33, 0.33))
-        cd_m = cfg.get("correct_dist_m", 500.0)
-        top_k_val = cfg.get("top_k", 30)
-
-        for sid in valid_sids:
-            gt_info = query_gt_info[sid]
-            true_lat, true_lon = gt_info["true_lat"], gt_info["true_lon"]
-            profile = query_profiles[sid]
-
-            # Determine expected compass offset
-            expected_offset = None
-            if use_cmp and "true_heading_deg" in gt_info:
-                mask_path = _resolve_mask_path(masks_dir, sid)
-                fov = gt_info.get("fov_y_deg", 65.0)
-                r_tilt = (
-                    np.array(gt_info["cam_R_tilt"])
-                    if gt_info.get("cam_R_tilt")
-                    else None
-                )
-                pr = extract_elevation_profile(
-                    mask_path, fov_y_deg=fov, r_tilt=r_tilt, bin_deg=bin_deg
-                )
-                expected_offset = (gt_info["true_heading_deg"] + pr["start_az"]) % 360.0
-
-            # Determine height constraint
-            gt_elevation = None
-            if use_alt and "eye_z_m" in gt_info:
-                gt_elevation = gt_info["eye_z_m"] - gt_info.get("query_height_m", 1.8)
-
-            # Apply coarse filtering on raw scores
-            coarse_mask = np.full(n_vp, False)
-            coarse_corr = np.full(n_vp, -np.inf, dtype=np.float32)
-            coarse_offset = np.zeros(n_vp, dtype=np.int32)
-
-            for vp_idx, (corr, offset) in raw_scores[sid].items():
-                # Compass filter
-                if expected_offset is not None:
-                    bin_idx = offset
-                    diff = abs(
-                        ((bin_idx * bin_deg - expected_offset + 180) % 360) - 180
-                    )
-                    if diff > compass_tol:
-                        continue
-                # Height filter
-                if gt_elevation is not None:
-                    if abs(elev_m[vp_idx] - gt_elevation) > height_tol:
-                        continue
-                coarse_mask[vp_idx] = True
-                coarse_corr[vp_idx] = corr
-                coarse_offset[vp_idx] = offset
-
-            # Collect top candidates for DTW
-            valid_vps = np.where(coarse_mask)[0]
-            if len(valid_vps) == 0:
+        for sid in queries:
+            run_corr, run_idx, run_off = topk_state[cfg_name][sid]
+            if len(run_idx) == 0:
                 continue
-            top_coarse_vps = valid_vps[np.argsort(-coarse_corr[valid_vps])][:top_k_val]
-
-            # Build a mock query_state for refine_query_with_dtw
-            query_state = {
-                "gt_info": gt_info,
-                "profile": profile,
-                "best_corr": coarse_corr,
-                "best_offset": coarse_offset,
-            }
-
+            order = np.argsort(-run_corr)
+            run_idx = run_idx[order]
+            run_off = run_off[order]
             result = _refine_from_raw(
-                query_state,
+                queries[sid],
                 db_path,
-                sp_stride,
+                meta["spatial_stride"],
                 n_vp,
                 lat_arr,
                 lon_arr,
-                dtw_window=dtw_w,
-                correct_dist_m=cd_m,
-                top_k=top_coarse_vps,
+                dtw_window=meta["dtw_window"],
+                correct_dist_m=meta["correct_dist_m"],
+                top_k=run_idx,
+                top_offsets=run_off,
             )
             if result is not None:
                 result["sample_id"] = sid
@@ -688,19 +745,20 @@ def run_parameter_sweep(
         df = pd.DataFrame(cfg_results)
         all_dfs[cfg_name] = df
         all_summaries[cfg_name] = summarize_results_at_thresholds(
-            df, len(valid_sids), thresholds_m
+            df, len(queries), thresholds_m
         )
         s = all_summaries[cfg_name]
         print(
             f"  {cfg_name}: n={s['n_samples']}, median={s['median_error_m']:.0f}m, "
-            f"top1@500m={s.get('top1_acc_500m', 0):.1f}%"
+            f"top1@500m={s.get('top1_acc_500m', 0):.1f}%",
+            flush=True,
         )
 
     return all_dfs, all_summaries
 
 
 def _refine_from_raw(
-    query_state,
+    query,
     db_path,
     spatial_stride,
     n_vp,
@@ -709,51 +767,43 @@ def _refine_from_raw(
     dtw_window=15,
     correct_dist_m=500.0,
     top_k=None,
+    top_offsets=None,
 ):
-    """DTW refinement starting from pre-computed coarse scores."""
-    if top_k is None:
-        valid_vps = np.where(query_state["best_corr"] > -np.inf)[0]
-        if len(valid_vps) == 0:
-            return None
-        top_k = valid_vps[np.argsort(-query_state["best_corr"][valid_vps])][:5]
+    """DTW refinement starting from a pre-computed candidate set."""
+    if top_k is None or len(top_k) == 0:
+        return None
+    if top_offsets is None:
+        top_offsets = np.zeros(len(top_k), dtype=np.int32)
 
     fine_candidate_set = set()
     for coarse_idx in top_k:
         local_range = np.arange(
-            max(0, coarse_idx - spatial_stride),
-            min(n_vp, coarse_idx + spatial_stride + 1),
+            max(0, int(coarse_idx) - spatial_stride),
+            min(n_vp, int(coarse_idx) + spatial_stride + 1),
         )
         fine_candidate_set.update(local_range)
     fine_indices = np.array(sorted(fine_candidate_set), dtype=np.int32)
 
     fetched_horizons = _fetch_rows(db_path, fine_indices)
+    profile = query["profile"]
     result_rows = []
-    profile_length = len(query_state["profile"])
+    profile_length = len(profile)
+    off_by_idx = {int(i): int(o) for i, o in zip(top_k, top_offsets)}
 
     for vp_idx in fine_indices:
         horizon_curve = fetched_horizons[vp_idx]
         horizon_length = len(horizon_curve)
-        offset_bin = int(query_state["best_offset"][vp_idx])
+        offset_bin = off_by_idx.get(int(vp_idx), 0)
         windowed = horizon_curve[
             np.arange(offset_bin, offset_bin + profile_length) % horizon_length
         ]
-        result_rows.append(
-            (
-                float(query_state["best_corr"][vp_idx]),
-                "main",
-                int(vp_idx),
-                offset_bin,
-                windowed,
-            )
-        )
+        result_rows.append((0.0, "main", int(vp_idx), offset_bin, windowed))
 
-    matches = finalize_matches(
-        _RowView(result_rows), query_state["profile"], dtw_window
-    )
+    matches = finalize_matches(_RowView(result_rows), profile, dtw_window)
     if not matches:
         return None
 
-    gt_info = query_state["gt_info"]
+    gt_info = query["gt_info"]
     true_lat, true_lon = gt_info["true_lat"], gt_info["true_lon"]
 
     best_match = matches[0]

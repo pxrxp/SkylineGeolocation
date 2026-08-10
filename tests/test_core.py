@@ -1,4 +1,5 @@
 """Core logic tests. No network, no GPU, no large data required."""
+
 import json
 import os
 import tempfile
@@ -67,15 +68,15 @@ class TestIsProfileApplicable:
 
 class TestComputeSkyDiagnostics:
     def test_half_sky(self):
-        mask = np.zeros((100, 100), dtype=np.uint8)
-        mask[:50, :] = 1
+        mask = np.full((100, 100), 255, dtype=np.uint8)
+        mask[:50, :] = 0
         d = _compute_sky_diagnostics(mask)
         assert abs(d["sky_ratio"] - 0.5) < 0.01
         assert d["boundary_coverage"] == 1.0
         assert d["top_connected"] is True
 
     def test_no_sky(self):
-        mask = np.zeros((100, 100), dtype=np.uint8)
+        mask = np.full((100, 100), 255, dtype=np.uint8)
         d = _compute_sky_diagnostics(mask)
         assert d["sky_ratio"] == 0.0
         assert d["num_components"] == 0
@@ -107,11 +108,12 @@ class TestMatchQuery:
 
 class TestComputeConfidence:
     def test_empty(self):
-        c = _compute_confidence([], [])
+        c = _compute_confidence([])
         assert c["ambiguous"]
 
     def test_gap(self):
-        c = _compute_confidence([0.5, 0.1], [10, 20])
+        matches = [{"score": 0.5}, {"score": 0.1}]
+        c = _compute_confidence(matches)
         assert abs(c["best_score"] - 0.5) < 0.01
         assert abs(c["score_gap"] - 0.4) < 0.01
 
@@ -121,8 +123,8 @@ class TestPipelineConfig:
         cfg = PipelineConfig()
         assert cfg.dist_search_km == 30.0
         assert cfg.azim_num == 360
-        assert cfg.bin_deg == 0.25
-        assert cfg.min_corr == 0.15
+        assert cfg.bin_deg == 1.0
+        assert cfg.min_corr == 0.30
         assert cfg.top_k == 5
 
     def test_override(self):
