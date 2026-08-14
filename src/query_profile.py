@@ -44,27 +44,36 @@ def extract_elevation_profile(
     Translates a binary sky-terrain mask into a 1D elevation-angle profile
     projected onto a uniform azimuth grid.
 
+    `mask_path` may be a file path (string) or a (H, W) numpy array / PIL Image
+    (sky=0/black, terrain=255/white convention).
+
     Returns:
         dict with keys: ok, status, reason, profile, start_az, diagnostics
     """
-    if not isinstance(mask_path, str) and not hasattr(mask_path, "startswith"):
+    if isinstance(mask_path, str):
+        try:
+            pil_img = Image.open(mask_path).convert("L")
+            mask = np.array(pil_img)
+        except Exception as e:
+            return {
+                "ok": False,
+                "status": "INVALID_INPUT",
+                "reason": f"Cannot open mask: {e}",
+                "profile": None,
+                "start_az": None,
+                "diagnostics": {},
+            }
+    elif isinstance(mask_path, np.ndarray):
+        mask = np.asarray(mask_path, dtype=np.uint8)
+        if mask.ndim == 3:
+            mask = mask[:, :, 0] if mask.shape[2] > 1 else mask[:, :, 0]
+    elif isinstance(mask_path, Image.Image):
+        mask = np.array(mask_path.convert("L"))
+    else:
         return {
             "ok": False,
             "status": "INVALID_INPUT",
-            "reason": "mask_path must be a string path",
-            "profile": None,
-            "start_az": None,
-            "diagnostics": {},
-        }
-
-    try:
-        pil_img = Image.open(mask_path).convert("L")
-        mask = np.array(pil_img)
-    except Exception as e:
-        return {
-            "ok": False,
-            "status": "INVALID_INPUT",
-            "reason": f"Cannot open mask: {e}",
+            "reason": f"mask_path must be a path or array, got {type(mask_path).__name__}",
             "profile": None,
             "start_az": None,
             "diagnostics": {},

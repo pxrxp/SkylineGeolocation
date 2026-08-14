@@ -187,8 +187,14 @@ def segment_image(
     max_sky_ratio=0.95,
     min_boundary_coverage=0.5,
     tta=True,
+    threshold=0.5,
+    return_prob=False,
 ):
     """Segment sky from a single image, save mask, return status + diagnostics.
+
+    `threshold`: P(sky) cutoff; sky mask = (prob_resized <= threshold) marks terrain
+    (kept black in saved mask). `return_prob`: include full-res `prob_resized` in
+    diagnostics (for offline threshold sweeps). `mask_output_path=None` skips saving.
 
     Returns:
         dict with keys: ok, status, reason, diagnostics, mask_path
@@ -240,14 +246,17 @@ def segment_image(
     prob_resized = cv2.resize(
         output_cropped.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR
     )
-    raw_mask = (prob_resized <= 0.5).astype(np.uint8)
+    raw_mask = (prob_resized <= threshold).astype(np.uint8)
 
     refined = refine_sky_mask_with_guidance(np.array(orig_img), raw_mask)
 
-    os.makedirs(os.path.dirname(mask_output_path) or ".", exist_ok=True)
-    Image.fromarray(refined).save(mask_output_path)
+    if mask_output_path is not None:
+        os.makedirs(os.path.dirname(mask_output_path) or ".", exist_ok=True)
+        Image.fromarray(refined).save(mask_output_path)
 
     diagnostics = _compute_sky_diagnostics(refined, prob_map=prob_resized)
+    if return_prob:
+        diagnostics["prob_map"] = prob_resized
 
     if diagnostics["sky_ratio"] < min_sky_ratio:
         return {
