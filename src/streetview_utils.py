@@ -61,18 +61,20 @@ def slice_perspective(
     rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
 
     # Apply camera rotation (yaw / pitch / roll) to convert to world frame.
-    # World frame: X=East, Y=Up, Z=North
+    # World frame: X=East, Y=Up, Z=North. Compass heading h: forward = (sin h, cos h)
     h = np.radians(heading_deg)
     p = np.radians(pitch_deg)
     r = np.radians(roll_deg)
 
-    # Yaw (rotation about world Y, clockwise looking down from +Y)
+    # Yaw: maps camera -Z (forward) to world (sin h, cos h) and camera +X
+    # (right) to the camera's right side (compass h+90). Fixes the prior
+    # 180-degree heading error and the horizontal mirror.
     cy, sy = np.cos(h), np.sin(h)
     R_yaw = np.array(
         [
-            [cy, 0.0, sy],
+            [cy, 0.0, -sy],
             [0.0, 1.0, 0.0],
-            [-sy, 0.0, cy],
+            [-sy, 0.0, -cy],
         ]
     )
     # Pitch (rotation about world X, positive = look up)
@@ -97,11 +99,15 @@ def slice_perspective(
     R_world = R_yaw @ R_pitch @ R_roll
     rays_world = rays @ R_world.T  # row-vector convention
 
-    # Map world rays to pano pixel coords
+    # Map world rays to pano pixel coords. Google pano columns run North
+    # (col 0) increasing clockwise (col w/4 = East), so the column index for a
+    # world ray is (compass azimuth / 360) * w. lon is measured from South;
+    # compass azimuth = 180 - degrees(lon) in this frame, giving:
+    #   col = (0.5 - lon/(2*pi)) * w
     lon = np.arctan2(rays_world[..., 0], -rays_world[..., 2])  # (-pi, pi]
     lat = np.arcsin(np.clip(rays_world[..., 1], -1.0, 1.0))  # [-pi/2, pi/2]
 
-    col_f = (lon / (2.0 * np.pi) + 0.5) * pano_w
+    col_f = (0.5 - lon / (2.0 * np.pi)) * pano_w
     row_f = (0.5 - lat / np.pi) * pano_h  # top of pano = +90 deg = zenith
 
     # Wrap columns (seamless)
