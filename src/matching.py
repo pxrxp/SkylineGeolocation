@@ -45,7 +45,7 @@ def _feature_bundle_matrix(mat):
     """Batch feature bundle: returns (value, d1) each (N, L)."""
     mat = np.asarray(mat, dtype=np.float64)
     value = _safe_zscore_matrix(mat)
-    d1 = _safe_zscore_matrix(np.gradient(mat, axis=1))
+    d1 = _safe_zscore_matrix(np.gradient(value, axis=1))
     return value, d1
 
 
@@ -190,7 +190,7 @@ def fft_prefilter(
     )
 
 
-def _compute_confidence(matches):
+def _compute_confidence(matches, min_score_gap=0.03):
     """Compute calibrated confidence from a sorted matches list.
 
     Returns dict with best_score, second_score, score_gap, ambiguous.
@@ -210,7 +210,7 @@ def _compute_confidence(matches):
         "best_score": best_score,
         "second_score": second_score,
         "score_gap": score_gap,
-        "ambiguous": score_gap < 0.03,
+        "ambiguous": score_gap < min_score_gap,
     }
 
 
@@ -373,7 +373,7 @@ def match_query(
             }
         )
 
-    confidence = _compute_confidence(matches)
+    confidence = _compute_confidence(matches, min_score_gap=min_score_gap)
 
     status = "OK"
     reason = "Match found"
@@ -382,7 +382,7 @@ def match_query(
         status = "LOW_CONFIDENCE"
         reason = f"Low correlation ({confidence['best_score']:.3f} < {min_corr})"
         ok = False
-    elif confidence["ambiguous"] and confidence["score_gap"] < min_score_gap:
+    elif confidence["ambiguous"]:
         status = "LOW_CONFIDENCE"
         reason = (
             f"Ambiguous top-2 score gap "

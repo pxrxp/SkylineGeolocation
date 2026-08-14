@@ -665,14 +665,18 @@ def run_parameter_sweep(
                 q = batch_meta[sid]
                 profile = q["profile"]
                 gt_info = q["gt_info"]
-                corr, offsets = ncc_scores(
-                    db_val, db_d1, profile, bin_deg, weights=(0.5, 0.5)
-                )
                 exp_off = None
                 if "true_heading_deg" in gt_info:
                     exp_off = (gt_info["true_heading_deg"] + q["start_az"]) % 360.0
 
                 for cfg_name, meta in cfg_meta.items():
+                    corr, offsets = ncc_scores(
+                        db_val,
+                        db_d1,
+                        profile,
+                        bin_deg,
+                        weights=meta["weights"],
+                    )
                     gate = np.ones(chunk_size, dtype=bool)
                     if meta["use_compass"] and exp_off is not None:
                         bin_off = offsets.astype(np.float64) * bin_deg
