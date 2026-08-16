@@ -1,9 +1,12 @@
 """Check every artifact Colab expects. Reports which exist, which don't."""
+
 import os
 from pathlib import Path
 
 
-def check(label: str, path: Path, expect_min_bytes: int = 0, expect_count: int = 0) -> bool:
+def check(
+    label: str, path: Path, expect_min_bytes: int = 0, expect_count: int = 0
+) -> bool:
     if not path.exists():
         print(f"  MISS  {label}: {path}")
         return False
@@ -27,10 +30,26 @@ def check(label: str, path: Path, expect_min_bytes: int = 0, expect_count: int =
 def main():
     print("=== Required artifacts ===")
     ok = True
-    ok &= check("DB parquet", Path("notebooks/02_SkylineDatabase/output/skyline_db.parquet"), expect_min_bytes=900_000_000)
-    ok &= check("Ground truth", Path("data/synthetic_dataset/ground_truth.json"), expect_min_bytes=200_000)
-    ok &= check("Predicted masks", Path("data/synthetic_dataset/predicted_masks"), expect_count=300)
-    ok &= check("Segmentation model", Path("data/sky_segmentation_unet_model.pth"), expect_min_bytes=20_000_000)
+    ok &= check(
+        "DB parquet",
+        Path("notebooks/02_SkylineDatabase/output/skyline_db.parquet"),
+        expect_min_bytes=400_000_000,
+    )
+    ok &= check(
+        "Ground truth",
+        Path("data/synthetic_dataset/ground_truth.json"),
+        expect_min_bytes=200_000,
+    )
+    ok &= check(
+        "Predicted masks",
+        Path("data/synthetic_dataset/predicted_masks"),
+        expect_count=300,
+    )
+    ok &= check(
+        "Segmentation model",
+        Path("data/sky_segmentation_unet_model.pth"),
+        expect_min_bytes=20_000_000,
+    )
 
     print("\n=== Optional ===")
     check("DEM", Path("data/digital_elevation_model/dem_30m.tif"))
@@ -43,4 +62,5 @@ def main():
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())

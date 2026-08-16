@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 from src.streetview_utils import slice_perspective
 from src.segmentation import load_segmentation_model, segment_image
 from src.query_profile import extract_elevation_profile
+from src.horizon_format import decode_horizon_uint8
 
 GT_PATH = ROOT / "data/street_view/ground_truth.json"
 CROP_PATH = ROOT / "data/street_view/crop_quality.json"
@@ -54,11 +55,10 @@ def _fetch_horizon(vp_idx):
     vp = int(vp_idx)
     rg = int(np.searchsorted(cum[1:], vp, side="right"))
     pos = vp - cum[rg]
-    return np.asarray(
+    return decode_horizon_uint8(
         pf.read_row_group(rg, columns=["raw_horizon_deg"])
         .to_pandas()["raw_horizon_deg"]
-        .iloc[pos],
-        dtype=np.float64,
+        .iloc[pos]
     )
 
 

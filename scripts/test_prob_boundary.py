@@ -17,6 +17,7 @@ from PIL import Image
 from src.segmentation import load_segmentation_model
 from src.query_profile import extract_elevation_profile
 from src.matching import _feature_bundle
+from src.horizon_format import decode_horizon_uint8
 
 GT_PATH = ROOT / "data" / "street_view" / "ground_truth.json"
 IMAGES_DIR = ROOT / "data" / "street_view" / "images"
@@ -35,11 +36,10 @@ def fetch_horizon(vp):
     cum = np.concatenate([[0], np.cumsum(rg_sizes)])
     rg = int(np.searchsorted(cum[1:], vp, side="right"))
     pos = vp - cum[rg]
-    return np.asarray(
+    return decode_horizon_uint8(
         pf.read_row_group(rg, columns=["raw_horizon_deg"])
         .to_pandas()["raw_horizon_deg"]
-        .iloc[pos],
-        dtype=np.float64,
+        .iloc[pos]
     )
 
 

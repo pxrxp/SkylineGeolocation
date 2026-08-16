@@ -23,6 +23,10 @@ DB_PATH = ROOT / "notebooks" / "02_SkylineDatabase" / "output" / "skyline_db.par
 SIDS = ["EZ15hr7Ojg3ito6i3BY6YA", "CIHM0ogKEICAgIC6rYfGdw", "5LDxSllCwStxt7aJ35F2Ww"]
 
 
+first = next(
+    pq.ParquetFile(DB_PATH).iter_batches(batch_size=1, columns=["raw_horizon_deg"])
+)
+BIN_DEG = 360.0 / len(first.to_pandas()["raw_horizon_deg"].iloc[0])
 def main():
     with open(GT_PATH) as f:
         gt = json.load(f)
@@ -35,7 +39,7 @@ def main():
             str(MASKS_DIR / f"{sid}.png"),
             fov_y_deg=g["fov_y_deg"],
             r_tilt=np.array(g["cam_R_tilt"]),
-            bin_deg=1.0,
+            bin_deg=BIN_DEG,
         )
         if pr["ok"]:
             profiles[sid] = (pr["profile"], int(g["closest_viewpoint_id"]), g)

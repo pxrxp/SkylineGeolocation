@@ -15,6 +15,7 @@ sys.path.insert(0, ROOT)
 
 from src.matching import feature_bundle_matrix, ncc_scores
 from src.query_profile import extract_elevation_profile
+from src.horizon_format import decode_horizon_uint8, decode_horizon_column
 from geopy.distance import geodesic
 
 DB = os.path.join(ROOT, "notebooks/02_SkylineDatabase/output/skyline_db.parquet")
@@ -41,7 +42,7 @@ def fetch_horizon(vp_idx):
     rg = int(vp_idx) // 4096
     pos = int(vp_idx) % 4096
     batch = pf.read_row_group(rg, columns=["raw_horizon_deg"])
-    return np.asarray(batch.to_pandas()["raw_horizon_deg"].iloc[pos], dtype=np.float64)
+    return decode_horizon_uint8(batch.to_pandas()["raw_horizon_deg"].iloc[pos])
 
 
 def ncc_at_horizon(horizon, profile, expected_off):
@@ -65,9 +66,7 @@ def global_peak(profile, exp_off, elev, sample_every=500):
     best_err = np.nan
     cs = 0
     for batch in pf.iter_batches(batch_size=4096, columns=["raw_horizon_deg"]):
-        cm = np.stack(batch.to_pandas()["raw_horizon_deg"].to_numpy()).astype(
-            np.float64
-        )
+        cm = decode_horizon_column(batch.to_pandas()["raw_horizon_deg"].to_numpy())
         n = len(cm)
         sel = np.arange(0, n, sample_every)
         db_val, db_d1 = feature_bundle_matrix(cm[sel])

@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from src.horizon_format import decode_horizon_uint8
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -35,11 +36,10 @@ def fetch_horizon(vp):
     cum = np.concatenate([[0], np.cumsum(rg_sizes)])
     rg = int(np.searchsorted(cum[1:], vp, side="right"))
     pos = vp - cum[rg]
-    return np.asarray(
+    return decode_horizon_uint8(
         pf.read_row_group(rg, columns=["raw_horizon_deg"])
         .to_pandas()["raw_horizon_deg"]
-        .iloc[pos],
-        dtype=np.float64,
+        .iloc[pos]
     )
 
 
@@ -62,6 +62,10 @@ def expected_skyline_rows(horizon, heading, pitch_deg, H, W):
     return row, world_az
 
 
+first = next(
+    pq.ParquetFile(DB_PATH).iter_batches(batch_size=1, columns=["raw_horizon_deg"])
+)
+BIN_DEG = 360.0 / len(first.to_pandas()["raw_horizon_deg"].iloc[0])
 def main():
     with open(GT_PATH) as f:
         gt = json.load(f)
@@ -94,7 +98,7 @@ def main():
             str(mask_path),
             fov_y_deg=g["fov_y_deg"],
             r_tilt=np.array(g["cam_R_tilt"]),
-            bin_deg=1.0,
+            bin_deg=BIN_DEG,
         )
         if not pr["ok"]:
             continue

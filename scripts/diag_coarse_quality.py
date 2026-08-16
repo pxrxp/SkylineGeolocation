@@ -16,12 +16,14 @@ sys.path.insert(0, ROOT)
 
 from src.matching import feature_bundle_matrix, ncc_scores
 from src.query_profile import extract_elevation_profile
+from src.horizon_format import decode_horizon_uint8, decode_horizon_column
 
 DB = os.path.join(ROOT, "notebooks/02_SkylineDatabase/output/skyline_db.parquet")
 N_VP = 1338650
 
 
 _META = pq.read_table(DB, columns=["lon", "lat", "elevation_m"])
+
 
 def coarse_topk(profile, exp_off, elev, stride, tol, k=10):
     """Return (dist of top1 to GT not available here) -> returns (topk_idx, topk_corr)."""
@@ -35,9 +37,7 @@ def coarse_topk(profile, exp_off, elev, stride, tol, k=10):
     best_off = np.zeros(N_VP, dtype=np.int32)
     cs = 0
     for batch in pf.iter_batches(batch_size=20000, columns=["raw_horizon_deg"]):
-        cm = np.stack(batch.to_pandas()["raw_horizon_deg"].to_numpy()).astype(
-            np.float64
-        )
+        cm = decode_horizon_column(batch.to_pandas()["raw_horizon_deg"].to_numpy())
         n = len(cm)
         stride_idx = np.arange(0, n, stride)
         db_val, db_d1 = feature_bundle_matrix(cm[stride_idx])
@@ -65,6 +65,10 @@ def coarse_topk(profile, exp_off, elev, stride, tol, k=10):
     return order, best_corr[order], lat_arr, lon_arr
 
 
+first = next(
+    pq.ParquetFile(DB_PATH).iter_batches(batch_size=1, columns=["raw_horizon_deg"])
+)
+BIN_DEG = 360.0 / len(first.to_pandas()["raw_horizon_deg"].iloc[0])
 def main():
     with open(os.path.join(ROOT, "data/street_view/ground_truth.json")) as f:
         gt = json.load(f)
@@ -79,7 +83,7 @@ def main():
             os.path.join(ROOT, f"data/street_view/masks/{sid}.png"),
             fov_y_deg=g.get("fov_y_deg", 65.0),
             r_tilt=np.array(g["cam_R_tilt"]),
-            bin_deg=1.0,
+            bin_deg=BIN_DEG,
         )
         if not pr["ok"]:
             print(f"{sid:<22} PROFILE_FAIL")

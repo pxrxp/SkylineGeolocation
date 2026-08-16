@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from src.query_profile import extract_elevation_profile
+from src.horizon_format import decode_horizon_uint8
 
 GT_PATH = ROOT / "data" / "synthetic_dataset" / "ground_truth.json"
 MASKS_DIR = ROOT / "data" / "synthetic_dataset" / "masks"
@@ -26,11 +27,10 @@ def fetch_horizon(vp):
     cum = np.concatenate([[0], np.cumsum(rg_sizes)])
     rg = int(np.searchsorted(cum[1:], vp, side="right"))
     pos = vp - cum[rg]
-    return np.asarray(
+    return decode_horizon_uint8(
         pf.read_row_group(rg, columns=["raw_horizon_deg"])
         .to_pandas()["raw_horizon_deg"]
-        .iloc[pos],
-        dtype=np.float64,
+        .iloc[pos]
     )
 
 

@@ -10,6 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from src.matching import _feature_bundle, _pearson_ncc_batch, feature_bundle_matrix
+from src.horizon_format import decode_horizon_uint8, decode_horizon_column
 
 DB = os.path.join(ROOT, "notebooks/02_SkylineDatabase/output/skyline_db.parquet")
 GT_PATH = os.path.join(ROOT, "data/synthetic_dataset/ground_truth.json")
@@ -36,7 +37,7 @@ def fetch_horizon(vp_idx):
     rg = int(np.searchsorted(rg_starts, vp_idx, side="right") - 1)
     pos = vp_idx - rg_starts[rg]
     batch = pf.read_row_group(rg, columns=["raw_horizon_deg"])
-    return np.asarray(batch.to_pandas()["raw_horizon_deg"].iloc[pos], dtype=np.float64)
+    return decode_horizon_uint8(batch.to_pandas()["raw_horizon_deg"].iloc[pos])
 
 
 def make_profile(horizon, fov_deg, heading_deg):
@@ -52,9 +53,7 @@ def full_scan_stride1(profile):
     all_corr = np.full(nv, -np.inf, dtype=np.float64)
     global_offset = 0
     for batch in pf.iter_batches(batch_size=4000, columns=["raw_horizon_deg"]):
-        cm = np.stack(batch.to_pandas()["raw_horizon_deg"].to_numpy()).astype(
-            np.float64
-        )
+        cm = decode_horizon_column(batch.to_pandas()["raw_horizon_deg"].to_numpy())
         n = len(cm)
         db_val, db_d1 = feature_bundle_matrix(cm)
 

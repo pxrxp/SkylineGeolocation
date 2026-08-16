@@ -15,6 +15,7 @@ sys.path.insert(0, ROOT)
 from src.streetview_utils import slice_perspective
 from src.segmentation import load_segmentation_model, segment_image
 from src.query_profile import extract_elevation_profile
+from src.horizon_format import decode_horizon_uint8
 
 DB = os.path.join(ROOT, "notebooks/02_SkylineDatabase/output/skyline_db.parquet")
 
@@ -23,11 +24,10 @@ def fetch_horizon(vp_idx):
     pf = pq.ParquetFile(DB)
     rg = int(vp_idx) // 4096
     pos = int(vp_idx) % 4096
-    return np.asarray(
+    return decode_horizon_uint8(
         pf.read_row_group(rg, columns=["raw_horizon_deg"])
         .to_pandas()["raw_horizon_deg"]
-        .iloc[pos],
-        dtype=np.float64,
+        .iloc[pos]
     )
 
 

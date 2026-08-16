@@ -6,7 +6,7 @@ DB chunks via `iter_batches`, no compass/expected-offset gating (matching is
 azimuth-shift-invariant; per-pano column-0 rotation is unknown).
 
 Per sample:
-  - extract profile from U-Net mask: fov_y from GT, r_tilt=cam_R_tilt, bin_deg=1.0
+  - extract profile from U-Net mask: fov_y from GT, r_tilt=cam_R_tilt, bin_deg=0.5
   - true-VP FB_best (best circular offset) — mask-quality metric
   - coarse scan over the full DB (spatial `stride`) -> top-5 by FB
   - geodesic error of best match
@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.matching import fft_prefilter
 from src.query_profile import extract_elevation_profile
+from src.horizon_format import decode_horizon_uint8, decode_horizon_column
 
 DB_PATH = ROOT / "notebooks/02_SkylineDatabase/output/skyline_db.parquet"
 GT_PATH = ROOT / "data/street_view/ground_truth.json"
@@ -51,7 +52,7 @@ def fetch_horizon(vp_idx):
     rg = int(np.searchsorted(rg_starts, vp_idx, side="right") - 1)
     pos = vp_idx - rg_starts[rg]
     batch = pf.read_row_group(rg, columns=["raw_horizon_deg"])
-    return np.asarray(batch.to_pandas()["raw_horizon_deg"].iloc[pos], dtype=np.float64)
+    return decode_horizon_uint8(batch.to_pandas()["raw_horizon_deg"].iloc[pos])
 
 
 def fb_at_best(profile, horizon):
@@ -134,8 +135,8 @@ def main():
         pf = pq.ParquetFile(str(DB_PATH))
         chunk_start = 0
         for batch in pf.iter_batches(batch_size=4000, columns=["raw_horizon_deg"]):
-            chunk = np.stack(batch.to_pandas()["raw_horizon_deg"].to_numpy()).astype(
-                np.float64
+            chunk = decode_horizon_column(
+                batch.to_pandas()["raw_horizon_deg"].to_numpy()
             )
             stride_rows = chunk[:: args.stride]
             corr, offsets = fft_prefilter(stride_rows, profile, bin_deg)

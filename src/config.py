@@ -13,7 +13,7 @@ class PipelineConfig:
 
     # Skyline DB
     dist_search_km: float = 30.0
-    azim_num: int = 360
+    azim_num: int = 720
     hori_acc_deg: float = 0.1
     eye_height_m: float = 1.6
     grid_spacing_m: float = 30.0
@@ -31,7 +31,7 @@ class PipelineConfig:
 
     # Profile
     fov_y_deg: float = 65.0
-    bin_deg: float = 1.0
+    bin_deg: float = 0.5
     median_kernel: int = 5
 
     # Matching

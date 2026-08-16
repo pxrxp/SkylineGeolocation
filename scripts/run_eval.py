@@ -11,6 +11,7 @@ from geopy.distance import geodesic
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.matching import fft_prefilter, finalize_matches
 from src.query_profile import extract_elevation_profile, is_profile_applicable
+from src.horizon_format import decode_horizon_column
 
 DB_PATH = "notebooks/02_SkylineDatabase/output/skyline_db.parquet"
 GT_PATH = "data/synthetic_dataset/ground_truth.json"
@@ -66,9 +67,7 @@ for sid in sample_ids:
     pf2 = pq.ParquetFile(DB_PATH)
     chunk_start = 0
     for batch in pf2.iter_batches(batch_size=4000, columns=["raw_horizon_deg"]):
-        chunk = np.stack(batch.to_pandas()["raw_horizon_deg"].to_numpy()).astype(
-            np.float64
-        )
+        chunk = decode_horizon_column(batch.to_pandas()["raw_horizon_deg"].to_numpy())
         corr, offsets = fft_prefilter(chunk, profile, bin_deg)
         top5 = np.argsort(-corr)[:5]
         for idx in top5:

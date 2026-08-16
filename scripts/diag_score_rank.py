@@ -14,6 +14,7 @@ sys.path.insert(0, ROOT)
 
 from src.matching import feature_bundle_matrix, ncc_scores
 from src.query_profile import extract_elevation_profile
+from src.horizon_format import decode_horizon_uint8
 from geopy.distance import geodesic
 
 DB = os.path.join(ROOT, "notebooks/02_SkylineDatabase/output/skyline_db.parquet")
@@ -32,11 +33,15 @@ def fetch_rows(indices):
         batch = pf.read_row_group(rg, columns=["raw_horizon_deg"]).to_pandas()
         for idx in idxs:
             out[idx] = np.asarray(
-                batch["raw_horizon_deg"].iloc[idx % 4096], dtype=np.float64
+                decode_horizon_uint8(batch["raw_horizon_deg"].iloc[idx % 4096])
             )
     return out
 
 
+first = next(
+    pq.ParquetFile(DB_PATH).iter_batches(batch_size=1, columns=["raw_horizon_deg"])
+)
+BIN_DEG = 360.0 / len(first.to_pandas()["raw_horizon_deg"].iloc[0])
 def main():
     with open(os.path.join(ROOT, "data/street_view/ground_truth.json")) as f:
         gt = json.load(f)
@@ -62,7 +67,7 @@ def main():
             os.path.join(ROOT, f"data/street_view/masks/{sid}.png"),
             fov_y_deg=g.get("fov_y_deg", 65.0),
             r_tilt=np.array(g["cam_R_tilt"]),
-            bin_deg=1.0,
+            bin_deg=BIN_DEG,
         )
         if not pr["ok"]:
             print(f"{sid:<22} PROFILE_FAIL")

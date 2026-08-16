@@ -21,6 +21,7 @@ import pyarrow.parquet as pq
 
 from src.evaluation import _stream_horizon_chunks
 from src.matching import feature_bundle_matrix, ncc_scores
+from src.horizon_format import decode_horizon_uint8
 
 GT_PATH = ROOT / "data" / "street_view" / "ground_truth.json"
 DB_PATH = ROOT / "notebooks" / "02_SkylineDatabase" / "output" / "skyline_db.parquet"
@@ -41,11 +42,10 @@ def main():
         if vp not in cache:
             rg = int(np.searchsorted(cum[1:], vp, side="right"))
             pos = vp - cum[rg]
-            cache[vp] = np.asarray(
+            cache[vp] = decode_horizon_uint8(
                 pf.read_row_group(rg, columns=["raw_horizon_deg"])
                 .to_pandas()["raw_horizon_deg"]
-                .iloc[pos],
-                dtype=np.float64,
+                .iloc[pos]
             )
         return cache[vp]
 

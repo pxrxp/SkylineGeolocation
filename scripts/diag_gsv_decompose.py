@@ -21,6 +21,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from src.query_profile import extract_elevation_profile
+from src.horizon_format import decode_horizon_uint8
 
 GT_PATH = ROOT / "data" / "street_view" / "ground_truth.json"
 MASKS_DIR = ROOT / "data" / "street_view" / "masks"
@@ -40,6 +41,7 @@ def stream_horizons(vp_set):
         )
         offset = int(np.sum(rg_sizes[:rg]))
         for pos, h in enumerate(cols["raw_horizon_deg"]):
+            h = decode_horizon_uint8(h)
             gv = offset + pos
             if gv in need:
                 found[gv] = np.asarray(h, dtype=np.float64)
@@ -69,6 +71,10 @@ def best_offset_corr(prof, hor):
     return float(corr[best]), best
 
 
+first = next(
+    pq.ParquetFile(DB_PATH).iter_batches(batch_size=1, columns=["raw_horizon_deg"])
+)
+BIN_DEG = 360.0 / len(first.to_pandas()["raw_horizon_deg"].iloc[0])
 def main():
     t0 = time.time()
     with open(GT_PATH) as f:
@@ -87,7 +93,7 @@ def main():
             str(mask_path),
             fov_y_deg=g["fov_y_deg"],
             r_tilt=np.array(g["cam_R_tilt"]),
-            bin_deg=1.0,
+            bin_deg=BIN_DEG,
         )
         if not pr["ok"]:
             continue

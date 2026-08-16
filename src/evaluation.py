@@ -16,6 +16,7 @@ from src.matching import (
     feature_bundle_matrix,
     ncc_scores,
 )
+from src.horizon_format import decode_horizon_uint8, decode_horizon_column
 
 
 def _stream_horizon_chunks(parquet_path, chunk_rows=4000):
@@ -33,9 +34,7 @@ def _stream_horizon_chunks(parquet_path, chunk_rows=4000):
             )
             bin_deg = 360.0 / len(horizon_grid)
 
-        chunk_matrix = np.stack(df_batch["raw_horizon_deg"].to_numpy()).astype(
-            np.float32
-        )
+        chunk_matrix = decode_horizon_column(df_batch["raw_horizon_deg"].to_numpy())
 
         yield chunk_matrix, bin_deg, global_offset
         global_offset += len(df_batch)
@@ -75,7 +74,7 @@ def _fetch_rows(parquet_path, row_indices):
         horizons = df_group["raw_horizon_deg"].to_numpy()
 
         for position, row_index in row_positions:
-            result[row_index] = np.asarray(horizons[position], dtype=np.float32)
+            result[row_index] = decode_horizon_uint8(horizons[position])
 
     return result
 

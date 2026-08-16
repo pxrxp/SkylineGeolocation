@@ -20,6 +20,10 @@ notebooks/01_RegionStudy/output/
 notebooks/02_SkylineDatabase/output/
 notebooks/*/output/
 
+# Eval outputs, per-sample corr caches, DB backups
+data/eval/
+data/db_backup/
+
 # ====================================================================
 # 3. IDE, Jupyter & OS Metadata
 # ====================================================================

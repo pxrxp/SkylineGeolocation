@@ -30,6 +30,7 @@ sys.path.insert(0, ROOT)
 
 from src.query_profile import extract_elevation_profile
 from src.matching import fft_prefilter
+from src.horizon_format import decode_horizon_column
 from scripts.gsv_eval import fetch_horizon, fb_at_best, DB_PATH
 
 GT_FILE = os.path.join(ROOT, "data/street_view/ground_truth.json")
@@ -40,6 +41,10 @@ MASKS_DIR = os.path.join(ROOT, "data/street_view/masks")
 OUT_DIR = os.path.join(ROOT, "data/street_view/diag")
 W, H = 1080, 720
 STRIDE = 12
+_first = next(
+    pq.ParquetFile(str(DB_PATH)).iter_batches(batch_size=1, columns=["raw_horizon_deg"])
+)
+BIN_DEG = 360.0 / len(_first.to_pandas()["raw_horizon_deg"].iloc[0])
 
 
 def mask_from_points(points):
@@ -70,11 +75,9 @@ def best_matches(profile, stride, topk=3):
     scores, idxs = [], []
     chunk_start = 0
     for batch in pf.iter_batches(batch_size=4000, columns=["raw_horizon_deg"]):
-        chunk = np.stack(batch.to_pandas()["raw_horizon_deg"].to_numpy()).astype(
-            np.float64
-        )
+        chunk = decode_horizon_column(batch.to_pandas()["raw_horizon_deg"].to_numpy())
         sub = chunk[::stride]
-        corr, offs = fft_prefilter(sub, profile, 1.0)
+        corr, offs = fft_prefilter(sub, profile, BIN_DEG)
         k = int(np.argmax(corr))
         scores.append((float(corr[k]), int(chunk_start + k * stride), int(offs[k])))
         chunk_start += len(chunk)
@@ -112,7 +115,9 @@ def main():
         r = res.get(sid, {})
 
         mask = mask_from_points(points)
-        pr = extract_elevation_profile(mask, fov_y_deg=fov, r_tilt=r_tilt, bin_deg=1.0)
+        pr = extract_elevation_profile(
+            mask, fov_y_deg=fov, r_tilt=r_tilt, bin_deg=BIN_DEG
+        )
         if not pr["ok"]:
             print(f"  {i} {sid}: profile FAIL {pr['status']}", flush=True)
             continue

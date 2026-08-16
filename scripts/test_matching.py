@@ -10,6 +10,7 @@ from geopy.distance import geodesic
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.matching import match_query
 from src.query_profile import extract_elevation_profile
+from src.horizon_format import decode_horizon_uint8, decode_horizon_column
 
 db_path = "notebooks/02_SkylineDatabase/output/skyline_db.parquet"
 gt_path = "data/synthetic_dataset/ground_truth.json"
@@ -36,7 +37,7 @@ print(f"bin_deg={bin_deg}", flush=True)
 
 print("Loading subset DB (first 5000 rows)...", flush=True)
 batch = next(pf.iter_batches(batch_size=5000, columns=["raw_horizon_deg"]))
-chunk = np.stack(batch.to_pandas()["raw_horizon_deg"].to_numpy()).astype(np.float64)
+chunk = decode_horizon_column(batch.to_pandas()["raw_horizon_deg"].to_numpy())
 db_matrix = chunk
 print(f"DB matrix: {db_matrix.shape}", flush=True)
 

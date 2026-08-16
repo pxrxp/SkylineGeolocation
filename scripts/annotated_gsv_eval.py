@@ -23,12 +23,17 @@ sys.path.insert(0, ROOT)
 
 from src.query_profile import extract_elevation_profile
 from src.matching import fft_prefilter
+from src.horizon_format import decode_horizon_column
 from scripts.gsv_eval import fetch_horizon, fb_at_best, DB_PATH
 
 _meta = pq.read_table(str(DB_PATH), columns=["lon", "lat"])
 lat_arr = _meta.column("lat").to_pandas().values
 lon_arr = _meta.column("lon").to_pandas().values
 NVPS = len(lat_arr)
+_first = next(
+    pq.ParquetFile(str(DB_PATH)).iter_batches(batch_size=1, columns=["raw_horizon_deg"])
+)
+BIN_DEG = 360.0 / len(_first.to_pandas()["raw_horizon_deg"].iloc[0])
 
 GT_FILE = os.path.join(ROOT, "data/street_view/ground_truth.json")
 ANNOT_FILE = os.path.join(ROOT, "data/street_view/annotations.json")
@@ -65,11 +70,9 @@ def best_match(profile, stride):
     best_idx = -1
     chunk_start = 0
     for batch in pf.iter_batches(batch_size=4000, columns=["raw_horizon_deg"]):
-        chunk = np.stack(batch.to_pandas()["raw_horizon_deg"].to_numpy()).astype(
-            np.float64
-        )
+        chunk = decode_horizon_column(batch.to_pandas()["raw_horizon_deg"].to_numpy())
         stride_rows = chunk[::stride]
-        corr, _ = fft_prefilter(stride_rows, profile, 1.0)
+        corr, _ = fft_prefilter(stride_rows, profile, BIN_DEG)
         k = int(np.argmax(corr))
         if corr[k] > best_corr:
             best_corr = float(corr[k])
@@ -105,7 +108,9 @@ def main():
             continue
 
         # headline: pitch 0, stride 12
-        pr = extract_elevation_profile(mask, fov_y_deg=fov, r_tilt=r_tilt, bin_deg=1.0)
+        pr = extract_elevation_profile(
+            mask, fov_y_deg=fov, r_tilt=r_tilt, bin_deg=BIN_DEG
+        )
         if not pr["ok"]:
             print(f"  {sid}: profile FAIL {pr['status']}")
             continue
@@ -120,11 +125,11 @@ def main():
         n_better = 0
         chunk_start = 0
         for batch in pf.iter_batches(batch_size=4000, columns=["raw_horizon_deg"]):
-            chunk = np.stack(batch.to_pandas()["raw_horizon_deg"].to_numpy()).astype(
-                np.float64
+            chunk = decode_horizon_column(
+                batch.to_pandas()["raw_horizon_deg"].to_numpy()
             )
             sub = chunk[::STRIDE]
-            c, _ = fft_prefilter(sub, profile, 1.0)
+            c, _ = fft_prefilter(sub, profile, BIN_DEG)
             n_better += int(np.sum(c > fb_true))
             chunk_start += len(chunk)
             del chunk, c
@@ -138,7 +143,7 @@ def main():
                 continue
             r_tilt_p = r_pitch(dp) @ r_tilt
             prp = extract_elevation_profile(
-                mask, fov_y_deg=fov, r_tilt=r_tilt_p, bin_deg=1.0
+                mask, fov_y_deg=fov, r_tilt=r_tilt_p, bin_deg=BIN_DEG
             )
             if not prp["ok"]:
                 continue
