@@ -49,6 +49,122 @@ def _feature_bundle_matrix(mat):
     return value, d1
 
 
+def saliency_weights(profile, alpha=2.0):
+    """Scale-invariant curvature-based saliency weights.
+
+    w(θ) = 1.0 + α · κ(θ)
+    κ(θ) = |d²z/dθ²| / std(|d²z/dθ²| + ε)
+
+    Sharp peaks/saddles get ~3× weight when α=2.0.
+    """
+    p = np.asarray(profile, dtype=np.float64)
+    d2 = np.gradient(np.gradient(p))
+    abs_d2 = np.abs(d2)
+    std_d2 = abs_d2.std()
+    kappa = abs_d2 / (std_d2 + 1e-6)
+    return 1.0 + alpha * kappa
+
+
+def fit_affine_scale_offset(db_horizon, profile, offset_bin):
+    """Least-squares affine fit profile ≈ A·db + b at the aligned offset.
+
+    Parameters
+    ----------
+    db_horizon : (L,) float — DB elevation-angle horizon.
+    profile : (M,) float — query elevation-angle profile.
+    offset_bin : int — circular DB-bin offset aligning profile to db_horizon.
+
+    Returns
+    -------
+    (A, b, rmse) — vertical scale, vertical offset, fit residual (deg).
+    """
+    db_horizon = np.asarray(db_horizon, dtype=np.float64)
+    profile = np.asarray(profile, dtype=np.float64)
+    L = len(db_horizon)
+    M = len(profile)
+    if M == 0 or L == 0:
+        return 0.0, 0.0, float("inf")
+
+    idx = (np.arange(M) + offset_bin) % L
+    db_a = db_horizon[idx]
+    dbm = db_a - db_a.mean()
+    pm = profile - profile.mean()
+    var = np.dot(dbm, dbm)
+    if var < 1e-12:
+        return 0.0, float(profile.mean()), float(np.std(profile))
+    A = float(np.dot(dbm, pm) / var)
+    b = float(profile.mean() - A * db_a.mean())
+    resid = profile - (A * db_a + b)
+    rmse = float(np.sqrt(np.mean(resid**2)))
+    return A, b, rmse
+
+
+AFFINE_SCALE_RANGE = (0.6, 1.6)
+
+
+def affine_scale_ok(A):
+    """True if vertical scale A is physically plausible."""
+    return AFFINE_SCALE_RANGE[0] <= A <= AFFINE_SCALE_RANGE[1]
+
+
+def _pearson_ncc_weighted_batch(db_ext, query_zm, q_norm, weights):
+    """Weighted Pearson NCC: Σ(w·q·db) / sqrt(Σ(w·q²)·Σ(w·db²)).
+
+    Numerator via FFT circular correlation; denominator via cumulative sums.
+    """
+    N, ext_len = db_ext.shape
+    M = len(query_zm)
+    L = ext_len - M + 1
+
+    # Circularly extend weights to the extended DB length
+    n_tile = int(np.ceil(ext_len / M))
+    weights_ext = np.tile(weights, n_tile)[:ext_len]  # (ext_len,)
+
+    # Weighted cross-correlation (numerator): Σ_k w_k · q_k · db_{(s+k) mod L}
+    qw = query_zm * weights  # (M,)
+    q_pad = np.zeros(L, dtype=np.float64)
+    q_pad[:M] = qw
+    fq = np.fft.rfft(q_pad)
+    fdb = np.fft.rfft(db_ext[:, :L], axis=1)
+    numer = np.fft.irfft(fdb * np.conj(fq), n=L, axis=1)
+
+    # Weighted denominator: Σ w_k · window_k² and Σ w_k over window
+    db_w = db_ext * weights_ext[np.newaxis, :]  # extend weights to (N, ext_len)
+
+    cum_wsum = np.concatenate(
+        [
+            np.zeros((N, 1), dtype=np.float64),
+            np.cumsum(weights_ext)[None, :].repeat(N, axis=0),
+        ],
+        axis=1,
+    )
+    cum_wdb = np.concatenate(
+        [np.zeros((N, 1), dtype=np.float64), np.cumsum(db_w, axis=1)], axis=1
+    )
+    cum_wsq = np.concatenate(
+        [
+            np.zeros((N, 1), dtype=np.float64),
+            np.cumsum(db_ext**2 * weights_ext[np.newaxis, :], axis=1),
+        ],
+        axis=1,
+    )
+
+    win_wsum = cum_wsum[:, M : M + L] - cum_wsum[:, :L]  # Σ w over window
+    win_wdb = cum_wdb[:, M : M + L] - cum_wdb[:, :L]  # Σ w·db over window
+    win_wsqsum = cum_wsq[:, M : M + L] - cum_wsq[:, :L]  # Σ w·db² over window
+
+    # Weighted variance: Σ w·db² - (Σ w·db)² / Σ w
+    win_wvar = win_wsqsum - win_wdb**2 / np.maximum(win_wsum, 1e-12)
+    win_wvar = np.maximum(win_wvar, 0.0)
+
+    # Query weighted norm: Σ w_k · q_k²
+    q_wnorm = np.sum(weights * query_zm**2)
+
+    denom = np.sqrt(q_wnorm * win_wvar)
+    ncc = numer / np.maximum(denom, 1e-12)
+    return ncc
+
+
 # ---------------------------------------------------------------------------
 # Pearson-normalised circular cross-correlation (vectorised)
 # ---------------------------------------------------------------------------
@@ -75,11 +191,13 @@ def _pearson_ncc_batch(db_ext, query_zm, q_norm):
     M = len(query_zm)
     L = ext_len - M + 1
 
-    # Sliding windows: (N, L, M) view — no extra memory
-    windows = np.lib.stride_tricks.sliding_window_view(db_ext, M, axis=1)
-
-    # Cross-correlation (numerator): q · window for each offset
-    numer = windows @ query_zm  # (N, L)
+    # Numerator via FFT-based circular cross-correlation (O(L log L) per row)
+    # instead of the sliding-window matmul (O(L·M)).
+    q_pad = np.zeros(L, dtype=np.float64)
+    q_pad[:M] = query_zm
+    fq = np.fft.rfft(q_pad)
+    fdb = np.fft.rfft(db_ext[:, :L], axis=1)
+    numer = np.fft.irfft(fdb * np.conj(fq), n=L, axis=1)
 
     # Denominator: L2-norm of each M-length window via cumulative sums
     cum = np.concatenate(
@@ -119,10 +237,19 @@ def ncc_scores(
     weights=(0.5, 0.5),
     expected_offset_deg=None,
     tolerance_deg=None,
+    saliency_alpha=0.0,
+    db_matrix=None,
+    elevation_penalty_weight=0.0,
+    max_elevation_diff_deg=10.0,
 ):
     """Pearson NCC of one query against precomputed DB features.
 
     db_val, db_d1 : (N, L) feature arrays from `feature_bundle_matrix`.
+    saliency_alpha : float — if > 0, apply scale-invariant curvature weighting.
+    db_matrix : (N, L) raw DB elevation-angle matrix (uint8-decoded degrees).
+        Required when elevation_penalty_weight > 0.
+    elevation_penalty_weight : float — gamma; penalizes |mean(query) - mean(DB_window)|
+        at the best NCC offset. Offsets with elev_diff > max_elevation_diff_deg → -inf.
     """
     query_profile = np.asarray(query_profile, dtype=np.float64)
     N, L = db_val.shape
@@ -135,8 +262,17 @@ def ncc_scores(
     q_val_zm = q_val - q_val.mean()
     q_d1_zm = q_d1 - q_d1.mean()
 
-    ncc_val = _pearson_ncc_batch(db_ext_val, q_val_zm, np.linalg.norm(q_val_zm))
-    ncc_d1 = _pearson_ncc_batch(db_ext_d1, q_d1_zm, np.linalg.norm(q_d1_zm))
+    if saliency_alpha > 0:
+        sw = saliency_weights(query_profile, alpha=saliency_alpha)
+        ncc_val = _pearson_ncc_weighted_batch(
+            db_ext_val, q_val_zm, np.linalg.norm(q_val_zm), sw
+        )
+        ncc_d1 = _pearson_ncc_weighted_batch(
+            db_ext_d1, q_d1_zm, np.linalg.norm(q_d1_zm), sw
+        )
+    else:
+        ncc_val = _pearson_ncc_batch(db_ext_val, q_val_zm, np.linalg.norm(q_val_zm))
+        ncc_d1 = _pearson_ncc_batch(db_ext_d1, q_d1_zm, np.linalg.norm(q_d1_zm))
 
     combined = weights[0] * ncc_val + weights[1] * ncc_d1
 
@@ -151,6 +287,25 @@ def ncc_scores(
 
     best_offset = np.argmax(combined, axis=1).astype(np.int32)
     best_corr = combined[np.arange(N), best_offset]
+
+    # --- Absolute elevation penalty ---
+    if elevation_penalty_weight > 0 and db_matrix is not None:
+        db_ext_raw = np.concatenate([db_matrix, db_matrix[:, : M - 1]], axis=1)
+        cum_raw = np.concatenate(
+            [np.zeros((N, 1), dtype=np.float64), np.cumsum(db_ext_raw, axis=1)],
+            axis=1,
+        )
+        win_sum_raw = cum_raw[:, M : M + L] - cum_raw[:, :L]
+        win_mean = win_sum_raw / M  # (N, L) mean elevation in degrees
+
+        query_mean = float(np.mean(query_profile))
+        matched_means = win_mean[np.arange(N), best_offset]
+        elev_diff = np.abs(query_mean - matched_means)
+
+        penalty = elevation_penalty_weight * elev_diff
+        penalty = np.where(elev_diff <= max_elevation_diff_deg, penalty, np.inf)
+        best_corr = best_corr - penalty
+
     return best_corr, best_offset
 
 
@@ -161,6 +316,7 @@ def fft_prefilter(
     weights=(0.5, 0.5),
     expected_offset_deg=None,
     tolerance_deg=None,
+    saliency_alpha=0.0,
 ):
     """Vectorised Pearson NCC prefilter over a database chunk.
 
@@ -168,10 +324,11 @@ def fft_prefilter(
     ----------
     db_matrix : (N, L) float array — raw elevation-angle horizons.
     query_profile : (M,) float array — query elevation-angle profile.
-    bin_deg : float — angular bin size in degrees (typically 1.0).
+    bin_deg : float — angular bin size in degrees (typically 0.5).
     weights : tuple — (weight_value, weight_d1). Sum need not be 1.
     expected_offset_deg : float or None — compass-derived expected offset.
     tolerance_deg : float or None — compass tolerance in degrees.
+    saliency_alpha : float — curvature saliency weight (0 = disabled).
 
     Returns
     -------
@@ -187,6 +344,7 @@ def fft_prefilter(
         weights=weights,
         expected_offset_deg=expected_offset_deg,
         tolerance_deg=tolerance_deg,
+        saliency_alpha=saliency_alpha,
     )
 
 
