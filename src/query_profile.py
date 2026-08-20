@@ -32,6 +32,44 @@ def is_profile_applicable(profile, min_std_deg=1.5, min_max_elev_deg=1.0):
     return True, "Valid topographic profile"
 
 
+def _subpixel_edge_from_image(gray, skyline_px, half_window=3):
+    """Parabolic sub-pixel edge fitting on image gradient.
+
+    For each column, compute the Sobel-Y gradient of the grayscale image,
+    find the peak near the binary-mask skyline boundary, and fit a 3-point
+    parabola to the gradient to extract a sub-pixel position.
+
+    Returns (H, W) float32 array of sub-pixel row positions.
+    """
+    H, W = gray.shape
+    gray_f = gray.astype(np.float64)
+    gy = np.zeros_like(gray_f)
+    gy[1:-1, :] = (gray_f[2:, :] - gray_f[:-2, :]) / 2.0
+    gy[0, :] = gray_f[1, :] - gray_f[0, :]
+    gy[-1, :] = gray_f[-1, :] - gray_f[-2, :]
+
+    sub_px = skyline_px.copy()
+    for c in range(W):
+        y0 = int(round(skyline_px[c]))
+        y_lo = max(1, y0 - half_window)
+        y_hi = min(H - 2, y0 + half_window)
+        if y_hi <= y_lo:
+            continue
+        segment = gy[y_lo : y_hi + 1, c]
+        peak = y_lo + int(np.argmax(np.abs(segment)))
+        if peak <= 0 or peak >= H - 1:
+            continue
+        gm1 = gy[peak - 1, c]
+        g0 = gy[peak, c]
+        gp1 = gy[peak + 1, c]
+        denom = 2.0 * (gp1 - 2.0 * g0 + gm1)
+        if abs(denom) > 1e-6:
+            offset = (gp1 - gm1) / denom
+            offset = np.clip(offset, -0.5, 0.5)
+            sub_px[c] = peak + offset
+    return sub_px
+
+
 def extract_elevation_profile(
     mask_path,
     fov_y_deg=65.0,
@@ -41,6 +79,7 @@ def extract_elevation_profile(
     min_boundary_coverage=0.5,
     column_keep_mask=None,
     azim_frame="camera",
+    image=None,
 ):
     """
     Translates a binary sky-terrain mask into a 1D elevation-angle profile
@@ -48,6 +87,14 @@ def extract_elevation_profile(
 
     `mask_path` may be a file path (string) or a (H, W) numpy array / PIL Image
     (sky=0/black, terrain=255/white convention).
+
+    Parameters
+    ----------
+    image : ndarray (H, W) or (H, W, 3) uint8, optional
+        Original grayscale or RGB photograph. When provided, sub-pixel edge
+        fitting is applied: the Sobel-Y gradient of the image is used to refine
+        each column's skyline row to 0.1-pixel precision via a 3-point parabolic
+        fit, eliminating integer-rounding quantisation noise.
 
     Returns:
         dict with keys: ok, status, reason, profile, start_az, diagnostics
@@ -142,6 +189,17 @@ def extract_elevation_profile(
 
     boundary_coverage = 1.0 - (missing_cols / W)
     skyline_px = ndimage.median_filter(skyline_px, size=5)
+
+    if image is not None:
+        gray = np.asarray(image)
+        if gray.ndim == 3:
+            gray = (
+                cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
+                if gray.shape[2] == 3
+                else gray[:, :, 0]
+            )
+        if gray.shape == (H, W):
+            skyline_px = _subpixel_edge_from_image(gray, skyline_px)
 
     kept_frac = 1.0
     if column_keep_mask is not None:

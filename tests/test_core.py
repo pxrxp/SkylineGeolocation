@@ -7,8 +7,20 @@ import numpy as np
 from pathlib import Path
 
 from src.region import Region, import_region
-from src.matching import match_query, _safe_zscore, _compute_confidence
-from src.query_profile import is_profile_applicable, extract_elevation_profile
+from src.matching import (
+    match_query,
+    _safe_zscore,
+    _compute_confidence,
+    saliency_weights,
+    fit_affine_scale_offset,
+    affine_scale_ok,
+)
+from src.query_profile import (
+    is_profile_applicable,
+    extract_elevation_profile,
+    evaluate_skyline_quality,
+    compute_column_keep_mask,
+)
 from src.segmentation import _compute_sky_diagnostics
 from src.config import PipelineConfig
 
@@ -122,8 +134,8 @@ class TestPipelineConfig:
     def test_defaults(self):
         cfg = PipelineConfig()
         assert cfg.dist_search_km == 30.0
-        assert cfg.azim_num == 360
-        assert cfg.bin_deg == 1.0
+        assert cfg.azim_num == 720
+        assert cfg.bin_deg == 0.5
         assert cfg.min_corr == 0.30
         assert cfg.top_k == 5
 
@@ -131,3 +143,81 @@ class TestPipelineConfig:
         cfg = PipelineConfig(dist_search_km=60.0, top_k=10)
         assert cfg.dist_search_km == 60.0
         assert cfg.top_k == 10
+
+
+class TestSaliencyWeights:
+    def test_flat_profile(self):
+        w = saliency_weights(np.zeros(100))
+        assert np.all(w == 1.0)
+
+    def test_single_peak(self):
+        p = np.zeros(200)
+        p[100] = 10.0
+        w = saliency_weights(p, alpha=2.0)
+        assert w[100] > 1.0
+        assert np.all(w[np.abs(np.arange(200) - 100) > 5] < w[100] + 1e-9)
+
+    def test_alpha_zero(self):
+        p = np.sin(np.linspace(0, 10, 200)) * 5
+        w = saliency_weights(p, alpha=0.0)
+        assert np.allclose(w, 1.0)
+
+    def test_bounded_positive(self):
+        p = np.sin(np.linspace(0, 10, 200)) * 5
+        w = saliency_weights(p, alpha=2.0)
+        assert w.min() >= 1.0
+        assert np.isfinite(w).all()
+
+
+class TestSkylineQualityGate:
+    def test_flat_profile_rejected(self):
+        img = np.full((64, 64, 3), 100, dtype=np.uint8)
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        mask[20:, :] = 255
+        passed, score, reason = evaluate_skyline_quality(img, mask, np.zeros(100))
+        assert not passed
+        assert reason == "FLAT_TERRAIN_NO_RELIEF"
+
+    def test_empty_profile_rejected(self):
+        img = np.full((64, 64, 3), 100, dtype=np.uint8)
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        passed, score, reason = evaluate_skyline_quality(img, mask, np.array([]))
+        assert not passed
+        assert reason == "EMPTY_PROFILE"
+
+
+class TestAffineFit:
+    def test_exact_affine_recovered(self):
+        rng = np.random.default_rng(1)
+        db = np.sin(np.linspace(0, 6, 720)) * 5 + 20
+        offset = 123
+        A_true, b_true = 1.2, -8.0
+        profile = A_true * np.roll(db, -offset)[:175] + b_true
+        A, b, rmse = fit_affine_scale_offset(db, profile, offset)
+        assert abs(A - A_true) < 1e-6
+        assert abs(b - b_true) < 1e-6
+        assert rmse < 1e-6
+
+    def test_scale_gate(self):
+        assert affine_scale_ok(1.0)
+        assert affine_scale_ok(0.6)
+        assert affine_scale_ok(1.6)
+        assert not affine_scale_ok(0.5)
+        assert not affine_scale_ok(1.7)
+        assert not affine_scale_ok(-0.5)
+
+
+class TestColumnKeepMask:
+    def test_flat_image_all_kept(self):
+        img = np.full((64, 64, 3), 100, dtype=np.uint8)
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        mask[20:, :] = 255
+        keep, per_col = compute_column_keep_mask(img, mask, gradient_threshold=8.0)
+        assert keep.shape == (64,)
+        assert keep.dtype == bool
+
+    def test_no_sky_columns_dropped(self):
+        img = np.full((64, 64, 3), 100, dtype=np.uint8)
+        mask = np.full((64, 64), 255, dtype=np.uint8)  # all terrain
+        keep, per_col = compute_column_keep_mask(img, mask, gradient_threshold=8.0)
+        assert not keep.any()

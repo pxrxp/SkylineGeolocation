@@ -7,6 +7,7 @@ thresholds are interpretable and defensible.
 """
 
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.distance import euclidean
 from scipy.stats import zscore
 from fastdtw import fastdtw
@@ -47,6 +48,39 @@ def _feature_bundle_matrix(mat):
     value = _safe_zscore_matrix(mat)
     d1 = _safe_zscore_matrix(np.gradient(value, axis=1))
     return value, d1
+
+
+def _dog_kernel(L, sigma1=2.0, sigma2=8.0):
+    """Difference-of-Gaussians bandpass kernel in frequency domain (length L)."""
+    x = np.zeros(L, dtype=np.float64)
+    x[L // 2] = 1.0
+    g1 = gaussian_filter1d(x, sigma1, mode="wrap")
+    g2 = gaussian_filter1d(x, sigma2, mode="wrap")
+    return g1 - g2
+
+
+def _feature_bundle_ms(profile, sigma1=2.0, sigma2=8.0):
+    """Multi-spectral: value + d1 + DoG bandpass, all z-scored."""
+    profile = np.asarray(profile, dtype=np.float64)
+    value = _safe_zscore(profile)
+    d1 = _safe_zscore(np.gradient(value))
+    dog = gaussian_filter1d(value, sigma1, mode="wrap") - gaussian_filter1d(
+        value, sigma2, mode="wrap"
+    )
+    dog = _safe_zscore(dog)
+    return value, d1, dog
+
+
+def _feature_bundle_matrix_ms(mat, sigma1=2.0, sigma2=8.0):
+    """Batch multi-spectral: returns (value, d1, dog) each (N, L)."""
+    mat = np.asarray(mat, dtype=np.float64)
+    value = _safe_zscore_matrix(mat)
+    d1 = _safe_zscore_matrix(np.gradient(value, axis=1))
+    dog = gaussian_filter1d(value, sigma1, mode="wrap", axis=1) - gaussian_filter1d(
+        value, sigma2, mode="wrap", axis=1
+    )
+    dog = _safe_zscore_matrix(dog)
+    return value, d1, dog
 
 
 def saliency_weights(profile, alpha=2.0):
