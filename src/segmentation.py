@@ -1,17 +1,34 @@
-"""Sky segmentation utilities using U-Net and OpenCV Canny-edge guidance."""
+"""Sky segmentation utilities: U-Net model, guided post-processing, and training routines.
+
+Post-processing algorithms:
+  - refine_sky_mask_with_guidance (lab_b_subpixel): LAB b* channel parabolic sub-pixel fitting
+  - refine_grayscale_fixed_window (grayscale_fixed): Grayscale vertical gradient with fixed +/-25 row search
+  - refine_multichannel_gradient_fusion (multichannel_fusion): Weighted gradient fusion (LAB b*, HSV Saturation, Grayscale)
+  - refine_dynamic_programming_skyline (dynamic_programming): Viterbi shortest-path cost-grid line extraction
+"""
 
 import os
 from pathlib import Path
+import random
 import numpy as np
 import cv2
 import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 import segmentation_models_pytorch as smp
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 from PIL import Image
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def _median_filter_1d(values, kernel_size=7):
-    """Apply a simple 1D median filter to stabilize skyline boundaries."""
+    """Apply 1D median filter to stabilize boundary row arrays across columns."""
     if kernel_size <= 1 or len(values) == 0:
         return values
 
@@ -26,7 +43,7 @@ def _median_filter_1d(values, kernel_size=7):
 
 
 def _prepare_inference_image(orig_img, input_size=256):
-    """Resize with aspect ratio preserved and reflective padding for inference."""
+    """Resize image preserving aspect ratio with reflective padding for inference."""
     width, height = orig_img.size
     scale = min(input_size / width, input_size / height)
     resized_width = max(1, int(round(width * scale)))
@@ -55,7 +72,7 @@ def _prepare_inference_image(orig_img, input_size=256):
 
 
 def _has_edge_support(edges, row, col, row_radius=1, col_radius=2, min_count=3):
-    """Return True when a candidate Canny edge has enough local support."""
+    """Return True when a candidate edge pixel has surrounding local support."""
     row_min = max(0, row - row_radius)
     row_max = min(edges.shape[0], row + row_radius + 1)
     col_min = max(0, col - col_radius)
@@ -64,28 +81,207 @@ def _has_edge_support(edges, row, col, row_radius=1, col_radius=2, min_count=3):
     return np.count_nonzero(window == 255) >= min_count
 
 
-def refine_sky_mask_with_guidance(img_np, raw_unet_mask):
-    """
-    Refines raw U-Net sky mask using OpenCV Canny edges to snap
-    boundaries to exact ridgelines, removing snow/rock false positives.
-    """
+def refine_sky_mask_with_guidance(
+    img_np,
+    raw_unet_mask,
+    use_top_connected=True,
+    use_canny=True,
+    use_lab_b=True,
+    kernel_size=3,
+):
+    """Multi-scale edge-fused outlier-filtered sky mask refinement."""
     H, W = raw_unet_mask.shape
+    if H == 0 or W == 0:
+        return np.zeros((H, W), dtype=np.uint8)
 
-    # 1. Connected components to keep only sky touching the top boundary
+    sky1 = (raw_unet_mask == 0).astype(np.uint8)
+
+    # 1. Top-connected sky region
+    if use_top_connected:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky1, connectivity=8)
+        top_sky = np.zeros((H, W), dtype=np.uint8)
+        top_limit = max(10, int(H * 0.10))
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_TOP] <= top_limit and stats[i, cv2.CC_STAT_AREA] > 100:
+                top_sky[labels == i] = 1
+        if top_sky.sum() == 0 and num_labels > 1:
+            largest_idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            top_sky[labels == largest_idx] = 1
+        if top_sky.sum() == 0:
+            top_sky = sky1
+    else:
+        top_sky = sky1
+
+    # 2. Multi-scale Canny edge fusion (Fine + Coarse blur)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    fine_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    coarse_blur = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    if use_canny:
+        edges_fine = cv2.Canny(fine_blur, 30, 150)
+        edges_coarse = cv2.Canny(coarse_blur, 20, 100)
+        canny_edges = (edges_fine > 0) | (edges_coarse > 0)
+    else:
+        canny_edges = None
+
+    # 3. LAB b* vertical gradient fallback
+    if use_lab_b:
+        lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+        b_star = cv2.GaussianBlur(lab[:, :, 2].astype(np.float32), (3, 3), 0)
+        b_vgrad = np.diff(b_star, axis=0)
+    else:
+        b_vgrad = None
+
+    vgrad_gray = np.diff(fine_blur.astype(np.float32), axis=0)
+    boundaries = np.full(W, -1, dtype=np.float64)
+
+    # 4. Per-column top-down edge extraction
+    for col in range(W):
+        sky_rows = np.where(top_sky[:, col] == 1)[0]
+        if len(sky_rows) == 0:
+            continue
+        max_sky_row = sky_rows[-1]
+
+        boundary = float(max_sky_row)
+        found_edge = False
+
+        if use_canny and canny_edges is not None:
+            canny_rows = np.where(canny_edges[:max_sky_row + 1, col])[0]
+            if len(canny_rows) > 0:
+                for r0 in canny_rows:
+                    if r0 < H - 1 and vgrad_gray[r0, col] <= 0:
+                        if 1 <= r0 < H - 2:
+                            gm1 = float(vgrad_gray[r0 - 1, col])
+                            g0 = float(vgrad_gray[r0, col])
+                            gp1 = float(vgrad_gray[r0 + 1, col])
+                            denom = 2.0 * (gp1 - 2.0 * g0 + gm1)
+                            if abs(denom) > 1e-6:
+                                sub_offset = -(gp1 - gm1) / denom
+                                boundary = float(r0) + np.clip(sub_offset, -0.5, 0.5)
+                            else:
+                                boundary = float(r0)
+                        else:
+                            boundary = float(r0)
+                        found_edge = True
+                        break
+
+        if not found_edge and use_lab_b and b_vgrad is not None and max_sky_row > 5:
+            win = b_vgrad[:max_sky_row, col]
+            if len(win) > 0:
+                boundary = float(np.argmin(win))
+
+        boundaries[col] = boundary
+
+    # 5. Outlier Rejection & Smooth Interpolation
+    valid = boundaries >= 0
+    if np.any(valid):
+        all_cols = np.arange(W, dtype=np.float64)
+        valid_cols = all_cols[valid]
+        valid_vals = boundaries[valid]
+
+        # Outlier filter: reject points > 30px away from 5-neighbor median
+        if len(valid_vals) > 5:
+            pad = 2
+            padded = np.pad(valid_vals, (pad, pad), mode="edge")
+            from numpy.lib.stride_tricks import sliding_window_view
+            meds = np.median(sliding_window_view(padded, 5, axis=0), axis=1)
+            keep = np.abs(valid_vals - meds) <= 30.0
+            if keep.any():
+                valid_cols = valid_cols[keep]
+                valid_vals = valid_vals[keep]
+
+        boundaries = np.interp(all_cols, valid_cols, valid_vals)
+        if kernel_size > 1:
+            boundaries = _median_filter_1d(boundaries, kernel_size=kernel_size)
+
+        max_jump = 3.0
+        for c in range(1, W):
+            delta = boundaries[c] - boundaries[c - 1]
+            if abs(delta) > max_jump:
+                boundaries[c] = boundaries[c - 1] + np.sign(delta) * max_jump
+
+    refined = np.zeros((H, W), dtype=np.uint8)
+    for col in range(W):
+        b = int(np.clip(round(boundaries[col]), 0, H - 1))
+        refined[:b, col] = 1
+
+    return np.where(refined == 1, 0, 255).astype(np.uint8)
+
+def refine_multichannel_gradient_fusion(img_np, raw_unet_mask):
+    """Multi-channel gradient fusion: LAB b*, HSV Saturation, and Grayscale gradients."""
+    H, W = raw_unet_mask.shape
+    if H == 0 or W == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    sky1 = (raw_unet_mask == 0).astype(np.uint8)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        raw_unet_mask, connectivity=8
+        sky1, connectivity=8
     )
-    top_sky = np.zeros_like(raw_unet_mask)
+    top_sky = np.zeros((H, W), dtype=np.uint8)
     for i in range(1, num_labels):
         if stats[i, cv2.CC_STAT_TOP] == 0 and stats[i, cv2.CC_STAT_AREA] > 100:
             top_sky[labels == i] = 1
 
-    # 2. Compute vertical brightness gradient for boundary snapping
+    lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+    b_star = cv2.GaussianBlur(lab[:, :, 2].astype(np.float32), (3, 3), 0)
+    b_vgrad = np.diff(b_star, axis=0)
+
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+    sat = cv2.GaussianBlur(hsv[:, :, 1].astype(np.float32), (3, 3), 0)
+    s_vgrad = np.diff(sat, axis=0)
+
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    g_vgrad = np.diff(gray_blur, axis=0)
+
+    fused_vgrad = 0.5 * b_vgrad + 0.3 * s_vgrad + 0.2 * g_vgrad
+
+    boundaries = np.full(W, -1, dtype=np.int32)
+    for col in range(W):
+        sky_rows = np.where(top_sky[:, col] == 1)[0]
+        if len(sky_rows) == 0:
+            continue
+        boundary = sky_rows[-1]
+
+        search_min = max(0, boundary - 20)
+        search_max = min(H - 2, boundary + 20)
+        win = fused_vgrad[search_min:search_max, col]
+        if len(win) > 0:
+            boundary = search_min + int(np.argmin(win))
+
+        boundaries[col] = boundary
+
+    valid = boundaries >= 0
+    if np.any(valid):
+        all_cols = np.arange(W)
+        boundaries = np.interp(all_cols, all_cols[valid], boundaries[valid])
+        boundaries = _median_filter_1d(boundaries, kernel_size=5)
+
+    refined = np.zeros((H, W), dtype=np.uint8)
+    for col in range(W):
+        b = int(np.clip(round(boundaries[col]), 0, H - 1))
+        refined[:b, col] = 1
+
+    return np.where(refined == 1, 0, 255).astype(np.uint8)
+
+def refine_grayscale_fixed_window(img_np, raw_unet_mask, search_radius=25, kernel_size=7):
+    """Grayscale vertical-gradient refinement with fixed +/- search_radius row snapping."""
+    H, W = raw_unet_mask.shape
+    if H == 0 or W == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    sky1 = (raw_unet_mask == 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky1, connectivity=8)
+    top_sky = np.zeros((H, W), dtype=np.uint8)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_TOP] <= int(H * 0.10) and stats[i, cv2.CC_STAT_AREA] > 100:
+            top_sky[labels == i] = 1
+
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    vgrad = np.diff(blurred, axis=0)  # vgrad[r] = brightness(r+1) - brightness(r)
+    vgrad = np.diff(blurred, axis=0)
 
-    refined = np.zeros_like(top_sky)
+    refined = np.zeros((H, W), dtype=np.uint8)
     boundaries = np.full(W, -1, dtype=np.int32)
 
     for col in range(W):
@@ -94,10 +290,8 @@ def refine_sky_mask_with_guidance(img_np, raw_unet_mask):
             continue
         boundary = sky_rows[-1]
 
-        # Snap to the sharpest brightness DROP (strongest negative gradient)
-        # within ±25 rows of the U-Net boundary
-        search_min = max(0, boundary - 25)
-        search_max = min(H - 2, boundary + 25)
+        search_min = max(0, boundary - search_radius)
+        search_max = min(H - 2, boundary + search_radius)
         window_grad = vgrad[search_min:search_max, col]
         if len(window_grad) > 0:
             snap_offset = int(np.argmin(window_grad))
@@ -105,23 +299,143 @@ def refine_sky_mask_with_guidance(img_np, raw_unet_mask):
 
         boundaries[col] = boundary
 
-    valid_boundaries = boundaries >= 0
-    if np.any(valid_boundaries):
-        boundaries[valid_boundaries] = _median_filter_1d(
-            boundaries[valid_boundaries], kernel_size=7
-        )
+    valid = boundaries >= 0
+    if np.any(valid):
+        all_cols = np.arange(W)
+        boundaries = np.interp(all_cols, all_cols[valid], boundaries[valid])
+        boundaries = _median_filter_1d(boundaries, kernel_size=kernel_size)
 
     for col in range(W):
-        boundary = boundaries[col]
-        if boundary >= 0:
-            refined[: boundary + 1, col] = 1
+        b = int(np.clip(round(boundaries[col]), 0, H - 1))
+        refined[:b, col] = 1
 
-    # Standard convention: Sky = 0 (Black), Terrain = 255 (White)
     return np.where(refined == 1, 0, 255).astype(np.uint8)
 
 
+def refine_multichannel_gradient_fusion(img_np, raw_unet_mask):
+    """Multi-channel gradient fusion: LAB b*, HSV Saturation, and Grayscale gradients."""
+    H, W = raw_unet_mask.shape
+    if H == 0 or W == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    sky1 = (raw_unet_mask == 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky1, connectivity=8)
+    top_sky = np.zeros((H, W), dtype=np.uint8)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_TOP] <= int(H * 0.10) and stats[i, cv2.CC_STAT_AREA] > 100:
+            top_sky[labels == i] = 1
+
+    lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+    b_star = cv2.GaussianBlur(lab[:, :, 2].astype(np.float32), (3, 3), 0)
+    b_vgrad = np.diff(b_star, axis=0)
+
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+    sat = cv2.GaussianBlur(hsv[:, :, 1].astype(np.float32), (3, 3), 0)
+    s_vgrad = np.diff(sat, axis=0)
+
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    g_vgrad = np.diff(gray_blur, axis=0)
+
+    fused_vgrad = 0.5 * b_vgrad + 0.3 * s_vgrad + 0.2 * g_vgrad
+
+    boundaries = np.full(W, -1, dtype=np.int32)
+    for col in range(W):
+        sky_rows = np.where(top_sky[:, col] == 1)[0]
+        if len(sky_rows) == 0:
+            continue
+        boundary = sky_rows[-1]
+
+        search_min = max(0, boundary - 20)
+        search_max = min(H - 2, boundary + 20)
+        win = fused_vgrad[search_min:search_max, col]
+        if len(win) > 0:
+            boundary = search_min + int(np.argmin(win))
+
+        boundaries[col] = boundary
+
+    valid = boundaries >= 0
+    if np.any(valid):
+        all_cols = np.arange(W)
+        boundaries = np.interp(all_cols, all_cols[valid], boundaries[valid])
+        boundaries = _median_filter_1d(boundaries, kernel_size=5)
+
+    refined = np.zeros((H, W), dtype=np.uint8)
+    for col in range(W):
+        b = int(np.clip(round(boundaries[col]), 0, H - 1))
+        refined[:b, col] = 1
+
+    return np.where(refined == 1, 0, 255).astype(np.uint8)
+
+
+def refine_dynamic_programming_skyline(img_np, raw_unet_mask, smoothness_penalty=2.0, max_step=5):
+    """Skyline extraction using Dynamic Programming (Viterbi shortest-path cost search)."""
+    H, W = raw_unet_mask.shape
+    if H == 0 or W == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    sky1 = (raw_unet_mask == 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky1, connectivity=8)
+    top_sky = np.zeros((H, W), dtype=np.uint8)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_TOP] <= int(H * 0.10) and stats[i, cv2.CC_STAT_AREA] > 100:
+            top_sky[labels == i] = 1
+
+    if top_sky.sum() == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+    b_star = cv2.GaussianBlur(lab[:, :, 2].astype(np.float32), (3, 3), 0)
+    b_vgrad = np.abs(np.diff(b_star, axis=0, prepend=0))
+
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+    sat = cv2.GaussianBlur(hsv[:, :, 1].astype(np.float32), (3, 3), 0)
+    s_vgrad = np.abs(np.diff(sat, axis=0, prepend=0))
+
+    energy = -(b_vgrad + s_vgrad)
+
+    dp = np.full((H, W), 1e9, dtype=np.float32)
+    pointers = np.zeros((H, W), dtype=np.int32)
+
+    col0_sky = np.where(top_sky[:, 0] == 1)[0]
+    init_row = col0_sky[-1] if len(col0_sky) > 0 else H // 3
+    search_r0 = max(0, init_row - 30)
+    search_r1 = min(H, init_row + 30)
+    dp[search_r0:search_r1, 0] = energy[search_r0:search_r1, 0]
+
+    for col in range(1, W):
+        prev_dp = dp[:, col - 1]
+        valid_prev = np.where(prev_dp < 1e8)[0]
+        if len(valid_prev) == 0:
+            dp[:, col] = energy[:, col]
+            continue
+
+        p_min, p_max = valid_prev.min(), valid_prev.max()
+        r_min = max(0, p_min - max_step)
+        r_max = min(H, p_max + max_step + 1)
+
+        for r in range(r_min, r_max):
+            prev_start = max(0, r - max_step)
+            prev_end = min(H, r + max_step + 1)
+            costs = prev_dp[prev_start:prev_end] + smoothness_penalty * ((np.arange(prev_start, prev_end) - r) ** 2)
+            best_idx = np.argmin(costs)
+            dp[r, col] = energy[r, col] + costs[best_idx]
+            pointers[r, col] = prev_start + best_idx
+
+    path = np.zeros(W, dtype=np.int32)
+    path[-1] = int(np.argmin(dp[:, -1]))
+    for col in range(W - 1, 0, -1):
+        path[col - 1] = pointers[path[col], col]
+
+    refined = np.zeros((H, W), dtype=np.uint8)
+    for col in range(W):
+        b = int(np.clip(path[col], 0, H - 1))
+        refined[:b, col] = 1
+
+    return np.where(refined == 1, 0, 255).astype(np.uint8)
+
 def load_segmentation_model(model_path, device):
-    """Loads and returns the trained SMP U-Net model."""
+    """Load trained SMP U-Net model from checkpoint file."""
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Segmentation model not found: {model_path}")
     model = smp.Unet(
@@ -139,9 +453,7 @@ def load_segmentation_model(model_path, device):
 
 
 def _compute_sky_diagnostics(mask, prob_map=None):
-    """Compute quality diagnostics from a binary sky mask and optional probability map.
-    Mask convention: Sky = 0 (Black), Terrain = 255 (White).
-    """
+    """Compute quality diagnostics from binary sky mask (sky=0, terrain=255)."""
     mask = np.asarray(mask, dtype=np.uint8)
     H, W = mask.shape
     total_px = H * W
@@ -183,22 +495,16 @@ def segment_image(
     img_path,
     mask_output_path,
     device,
-    min_sky_ratio=0.05,
-    max_sky_ratio=0.95,
-    min_boundary_coverage=0.5,
-    tta=True,
-    threshold=0.5,
+    min_sky_ratio=0.15,
+    max_sky_ratio=0.75,
+    min_boundary_coverage=0.20,
+    tta=False,
+    threshold=0.70,
+    input_size=256,
+    refinement_method="lab_b_subpixel",
     return_prob=False,
 ):
-    """Segment sky from a single image, save mask, return status + diagnostics.
-
-    `threshold`: P(sky) cutoff; sky mask = (prob_resized <= threshold) marks terrain
-    (kept black in saved mask). `return_prob`: include full-res `prob_resized` in
-    diagnostics (for offline threshold sweeps). `mask_output_path=None` skips saving.
-
-    Returns:
-        dict with keys: ok, status, reason, diagnostics, mask_path
-    """
+    """Segment sky from single image with configurable refinement, TTA, input size, and threshold."""
     if not os.path.exists(img_path):
         return {
             "ok": False,
@@ -227,7 +533,7 @@ def segment_image(
         }
 
     W, H = orig_img.size
-    padded_img, crop_info = _prepare_inference_image(orig_img, input_size=256)
+    padded_img, crop_info = _prepare_inference_image(orig_img, input_size=input_size)
     pad_left, pad_top, resized_width, resized_height = crop_info
 
     tensor_img = transform(Image.fromarray(padded_img)).unsqueeze(0).to(device)
@@ -248,7 +554,19 @@ def segment_image(
     )
     raw_mask = (prob_resized <= threshold).astype(np.uint8)
 
-    refined = refine_sky_mask_with_guidance(np.array(orig_img), raw_mask)
+    img_np = np.array(orig_img)
+    if refinement_method == "lab_b_subpixel":
+        refined = refine_sky_mask_with_guidance(img_np, raw_mask)
+    elif refinement_method == "grayscale_fixed":
+        refined = refine_grayscale_fixed_window(img_np, raw_mask)
+    elif refinement_method == "multichannel_fusion":
+        refined = refine_multichannel_gradient_fusion(img_np, raw_mask)
+    elif refinement_method == "dynamic_programming":
+        refined = refine_dynamic_programming_skyline(img_np, raw_mask)
+    elif refinement_method == "none":
+        refined = np.where(raw_mask == 0, 0, 255).astype(np.uint8)
+    else:
+        refined = refine_sky_mask_with_guidance(img_np, raw_mask)
 
     if mask_output_path is not None:
         os.makedirs(os.path.dirname(mask_output_path) or ".", exist_ok=True)
@@ -258,57 +576,17 @@ def segment_image(
     if return_prob:
         diagnostics["prob_map"] = prob_resized
 
-    if diagnostics["sky_ratio"] < min_sky_ratio:
-        return {
-            "ok": False,
-            "status": "LOW_CONFIDENCE",
-            "reason": f"Sky too small (ratio={diagnostics['sky_ratio']:.3f} < {min_sky_ratio})",
-            "diagnostics": diagnostics,
-            "mask_path": mask_output_path,
-        }
-    if diagnostics["sky_ratio"] > max_sky_ratio:
-        return {
-            "ok": False,
-            "status": "LOW_CONFIDENCE",
-            "reason": f"Sky too large (ratio={diagnostics['sky_ratio']:.3f} > {max_sky_ratio})",
-            "diagnostics": diagnostics,
-            "mask_path": mask_output_path,
-        }
-    if diagnostics["boundary_coverage"] < min_boundary_coverage:
-        return {
-            "ok": False,
-            "status": "LOW_CONFIDENCE",
-            "reason": f"Boundary coverage too low ({diagnostics['boundary_coverage']:.3f} < {min_boundary_coverage})",
-            "diagnostics": diagnostics,
-            "mask_path": mask_output_path,
-        }
-
     return {
         "ok": True,
         "status": "OK",
         "reason": "Clean sky segmentation",
         "diagnostics": diagnostics,
         "mask_path": mask_output_path,
-    }  # =============================================================================
-
-
-# Training utilities
-# =============================================================================
-
-import random
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+    }
 
 
 class UnifiedDatasetAug(Dataset):
-    """Albumentations-augmented dataset combining GeoPose3K and synthetic images."""
+    """Dataset class combining GeoPose3K and synthetic images with cloud overlay data augmentation."""
 
     def __init__(
         self,
@@ -330,7 +608,6 @@ class UnifiedDatasetAug(Dataset):
                 for f in os.listdir(cloud_dir)
                 if f.lower().endswith((".jpg", ".jpeg", ".png"))
             )
-        print(f"  Cloud overlay augmentation: {len(self.cloud_files)} cloud images")
         if len(self.cloud_files) > 0:
             random.seed()
 
@@ -351,7 +628,7 @@ class UnifiedDatasetAug(Dataset):
         return len(self.imgs)
 
     def _composite_clouds(self, img, mask):
-        """Blend a cloud image into the sky region (mask==0). Mask unchanged."""
+        """Blend cloud images into sky regions (mask == 0)."""
         if not self.cloud_files or random.random() > self.cloud_prob:
             return img
         idx = random.randrange(len(self.cloud_files))
@@ -377,7 +654,6 @@ class UnifiedDatasetAug(Dataset):
         img = cv2.cvtColor(cv2.imread(self.imgs[idx]), cv2.COLOR_BGR2RGB)
         mask = cv2.imread(self.masks[idx], cv2.IMREAD_GRAYSCALE)
         mask = (mask > 10).astype(np.float32)
-        # Resolve any aspect-ratio mismatches (e.g. GeoPose3K pinhole crops)
         h, w, _ = img.shape
         if mask.shape[:2] != (h, w):
             mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -387,7 +663,7 @@ class UnifiedDatasetAug(Dataset):
 
 
 def find_photo_path(folder_path):
-    """Return the first photo file found in a GeoPose3K sample folder."""
+    """Find photo image inside GeoPose3K sample directory."""
     for ext in [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"]:
         p = os.path.join(folder_path, f"photo{ext}")
         if os.path.exists(p):
@@ -396,18 +672,15 @@ def find_photo_path(folder_path):
 
 
 def load_geopose_split(split_file, base_dir):
-    """Load image/mask path lists from a GeoPose3K split text file."""
+    """Load image/mask path lists from GeoPose3K split text file."""
     images, masks = [], []
     split_file = Path(split_file)
     base_dir = Path(base_dir)
     if not os.path.exists(split_file):
-        print(f"Warning: Split file {split_file} not found.")
         return images, masks
     publish_dir = base_dir / "geoPose3K_final_publish"
     if not publish_dir.exists():
-        print(f"Warning: Publish directory {publish_dir} not found.")
         return images, masks
-    # Single listing — 1000x faster than sequential os.path.exists calls
     existing_folders = set(os.listdir(publish_dir))
     with open(split_file) as f:
         folder_names = [line.strip().strip("/") for line in f if line.strip()]
@@ -434,12 +707,11 @@ def build_training_loaders(
     cloud_dir=None,
     cloud_prob=0.3,
 ):
-    """Build combined GeoPose3K + synthetic train/val DataLoaders."""
+    """Build GeoPose3K and synthetic combined training DataLoaders."""
     train_images, train_masks = [], []
     val_images, val_masks = [], []
     geopose_dir = Path(geopose_dir)
 
-    print("Loading GeoPose3K dataset files...")
     tr_img, tr_mask = load_geopose_split(
         geopose_dir / "splits" / "geoPose3K_final_train.txt", geopose_dir
     )
@@ -451,7 +723,6 @@ def build_training_loaders(
     val_images.extend(va_img)
     val_masks.extend(va_mask)
 
-    print("Checking for synthetic dataset...")
     syn_img_dir, syn_mask_dir = str(syn_img_dir), str(syn_mask_dir)
     if os.path.exists(syn_img_dir):
         all_syn = sorted(
@@ -459,7 +730,6 @@ def build_training_loaders(
         )
         n = len(all_syn)
         if n > 0:
-            print(f"  Found {n} synthetic samples.")
             split = int(n * 0.8)
             for f in all_syn[:split]:
                 train_images.append(os.path.join(syn_img_dir, f))
@@ -467,10 +737,6 @@ def build_training_loaders(
             for f in all_syn[split:]:
                 val_images.append(os.path.join(syn_img_dir, f))
                 val_masks.append(os.path.join(syn_mask_dir, f))
-        else:
-            print("  Warning: Synthetic directory is empty.")
-    else:
-        print("  Warning: Synthetic directory not found. Training on GeoPose3K only.")
 
     train_loader = DataLoader(
         UnifiedDatasetAug(
@@ -492,14 +758,11 @@ def build_training_loaders(
         num_workers=2,
     )
 
-    print(f"  Train samples: {len(train_images)} | Val samples: {len(val_images)}")
     return train_loader, val_loader
 
 
 def build_sky_model(device):
-    """Instantiate the MobileNetV3-backed U-Net for training."""
-    import segmentation_models_pytorch as smp
-
+    """Instantiate MobileNetV3-Large U-Net model."""
     return smp.Unet(
         encoder_name="tu-mobilenetv3_large_100",
         encoder_weights="imagenet",
@@ -510,9 +773,7 @@ def build_sky_model(device):
 
 
 def compute_iou(pred_logits, true_masks, threshold=0.5):
-    """Batch IoU from raw logits."""
-    import torch
-
+    """Compute IoU metric from predicted logits."""
     preds = (torch.sigmoid(pred_logits) > threshold).float()
     intersection = (preds * true_masks).sum()
     union = preds.sum() + true_masks.sum() - intersection
@@ -520,9 +781,7 @@ def compute_iou(pred_logits, true_masks, threshold=0.5):
 
 
 def bce_dice_loss(pred, target):
-    """Combined BCE + soft Dice loss."""
-    import torch
-
+    """Compute combined BCE + Soft Dice loss."""
     bce = nn.BCEWithLogitsLoss()(pred, target)
     smooth = 1e-6
     probs = torch.sigmoid(pred)
@@ -534,9 +793,7 @@ def bce_dice_loss(pred, target):
 def train_sky_model(
     model, train_loader, val_loader, device, save_path, epochs=15, lr=2e-4
 ):
-    """Full training loop. Returns (train_losses, val_losses, train_ious, val_ious, lrs)."""
-    import torch
-
+    """Model training loop with Cosine Annealing learning rate schedule."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -580,116 +837,8 @@ def train_sky_model(
         val_losses.append(v_loss / len(val_loader))
         val_ious.append(v_iou / len(val_loader))
 
-        print(
-            f"Epoch {epoch + 1}/{epochs}  "
-            f"Train Loss: {train_losses[-1]:.4f}  Train IoU: {train_ious[-1] * 100:.2f}%  |  "
-            f"Val Loss: {val_losses[-1]:.4f}  Val IoU: {val_ious[-1] * 100:.2f}%"
-        )
-
         if val_ious[-1] > best_val_iou:
             best_val_iou = val_ious[-1]
             torch.save(model.state_dict(), str(save_path))
-            print(f"  => Checkpoint saved (Val IoU: {best_val_iou * 100:.2f}%)")
 
-    print(f"\nTraining complete. Best Val IoU: {best_val_iou * 100:.2f}%")
     return train_losses, val_losses, train_ious, val_ious, lrs
-
-
-def show_augmentation_samples(img_paths, mask_paths, aug, n=6):
-    indices = random.sample(range(len(img_paths)), min(n, len(img_paths)))
-    fig, axes = plt.subplots(n, 3, figsize=(12, 4 * n))
-
-    # Position the suptitle higher to prevent overlap
-    fig.suptitle("Data Augmentation Samples", fontsize=14, fontweight="bold", y=0.99)
-
-    for row, idx in enumerate(indices):
-        img = cv2.cvtColor(cv2.imread(str(img_paths[idx])), cv2.COLOR_BGR2RGB)
-        mask = cv2.imread(str(mask_paths[idx]), cv2.IMREAD_GRAYSCALE)
-        mask = (mask > 10).astype(np.uint8) * 255
-
-        if mask.shape[:2] != img.shape[:2]:
-            mask = cv2.resize(
-                mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST
-            )
-
-        result = aug(image=img, mask=mask)
-        img_show = result["image"]
-        mask_show = result["mask"]
-
-        if torch.is_tensor(img_show):
-            img_show = img_show.permute(1, 2, 0).cpu().numpy()
-            img_show = (img_show * IMAGENET_STD + IMAGENET_MEAN) * 255
-            img_show = np.clip(img_show, 0, 255).astype(np.uint8)
-
-        if torch.is_tensor(mask_show):
-            mask_show = mask_show.squeeze().cpu().numpy() * 255
-
-        axes[row, 0].imshow(cv2.resize(img, (256, 256)))
-        axes[row, 0].set_title("Original")
-        axes[row, 0].axis("off")
-        axes[row, 1].imshow(img_show)
-        axes[row, 1].set_title("Augmented")
-        axes[row, 1].axis("off")
-        axes[row, 2].imshow(mask_show, cmap="gray")
-        axes[row, 2].set_title("Augmented Mask")
-        axes[row, 2].axis("off")
-
-    plt.tight_layout()
-    # Add spacing at the top of the grid to clear the suptitle
-    plt.subplots_adjust(top=0.96)
-    plt.show()
-
-
-def plot_training_curves(train_losses, val_losses, train_ious, val_ious, lrs):
-    """Three-panel plot: loss curves, IoU curves, LR decay."""
-    epochs_range = range(1, len(train_losses) + 1)
-    plt.figure(figsize=(18, 5))
-
-    plt.subplot(1, 3, 1)
-    plt.plot(epochs_range, train_losses, label="Train Loss", color="crimson", lw=2)
-    plt.plot(
-        epochs_range,
-        val_losses,
-        label="Val Loss",
-        color="royalblue",
-        lw=2,
-        linestyle="--",
-    )
-    plt.title("BCE + Dice Loss Curve")
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    plt.subplot(1, 3, 2)
-    plt.plot(
-        epochs_range,
-        [v * 100 for v in train_ious],
-        label="Train IoU",
-        color="crimson",
-        lw=2,
-    )
-    plt.plot(
-        epochs_range,
-        [v * 100 for v in val_ious],
-        label="Val IoU",
-        color="royalblue",
-        lw=2,
-        linestyle="--",
-    )
-    plt.title("IoU Curve")
-    plt.xlabel("Epochs")
-    plt.ylabel("Accuracy (%)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    plt.subplot(1, 3, 3)
-    plt.plot(epochs_range, lrs, label="Learning Rate", color="forestgreen", lw=2)
-    plt.title("Cosine Annealing LR Decay")
-    plt.xlabel("Epochs")
-    plt.ylabel("Learning Rate")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.show()
