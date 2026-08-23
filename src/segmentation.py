@@ -1,9 +1,9 @@
 """Sky segmentation utilities: U-Net model, guided post-processing, and training routines.
 
 Post-processing algorithms:
-  - refine_sky_mask_with_guidance (lab_b_subpixel): LAB b* channel parabolic sub-pixel fitting
-  - refine_grayscale_fixed_window (grayscale_fixed): Grayscale vertical gradient with fixed +/-25 row search
-  - refine_multichannel_gradient_fusion (multichannel_fusion): Weighted gradient fusion (LAB b*, HSV Saturation, Grayscale)
+  - refine_sky_mask_with_guidance (lab_b_subpixel): CLAHE-enhanced multi-scale Canny + LAB b* channel sub-pixel fitting
+  - refine_grayscale_fixed_window (grayscale_fixed): CLAHE-enhanced grayscale vertical gradient with fixed +/-25 row search
+  - refine_multichannel_gradient_fusion (multichannel_fusion): CLAHE-enhanced weighted gradient fusion (LAB b*, HSV Saturation, Grayscale)
   - refine_dynamic_programming_skyline (dynamic_programming): Viterbi shortest-path cost-grid line extraction
 """
 
@@ -87,23 +87,26 @@ def refine_sky_mask_with_guidance(
     use_top_connected=True,
     use_canny=True,
     use_lab_b=True,
+    use_clahe=True,
     kernel_size=3,
 ):
-    """Multi-scale edge-fused outlier-filtered sky mask refinement."""
+    """Multi-scale edge-fused outlier-filtered sky mask refinement with CLAHE dehazing."""
     H, W = raw_unet_mask.shape
     if H == 0 or W == 0:
         return np.zeros((H, W), dtype=np.uint8)
 
-    sky1 = (raw_unet_mask == 0).astype(np.uint8)
+    sky1 = (raw_unet_mask == 1).astype(np.uint8)
 
-    # 1. Top-connected sky region
+# 1. Top-connected sky region with smart fallback
     if use_top_connected:
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky1, connectivity=8)
         top_sky = np.zeros((H, W), dtype=np.uint8)
-        top_limit = max(10, int(H * 0.10))
+        top_limit = max(15, int(H * 0.15))
         for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_TOP] <= top_limit and stats[i, cv2.CC_STAT_AREA] > 100:
+            if stats[i, cv2.CC_STAT_TOP] <= top_limit and stats[i, cv2.CC_STAT_AREA] > 50:
                 top_sky[labels == i] = 1
+
+        # FALLBACK: If no sky in top 15%, use largest sky component
         if top_sky.sum() == 0 and num_labels > 1:
             largest_idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
             top_sky[labels == largest_idx] = 1
@@ -112,8 +115,16 @@ def refine_sky_mask_with_guidance(
     else:
         top_sky = sky1
 
-    # 2. Multi-scale Canny edge fusion (Fine + Coarse blur)
+    # 2. Multi-scale Canny edge fusion with sky-zone mild CLAHE
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    if use_clahe:
+        # Mild CLAHE to remove fog without boosting rock noise
+        clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16, 16))
+        gray_enhanced = clahe.apply(gray)
+        # Apply enhanced gray ONLY in sky region where fog lives
+        sky_mask_zone = cv2.dilate(top_sky, np.ones((15, 15), np.uint8)) > 0
+        gray = np.where(sky_mask_zone, gray_enhanced, gray)
+
     fine_blur = cv2.GaussianBlur(gray, (3, 3), 0)
     coarse_blur = cv2.GaussianBlur(gray, (7, 7), 0)
 
@@ -135,40 +146,36 @@ def refine_sky_mask_with_guidance(
     vgrad_gray = np.diff(fine_blur.astype(np.float32), axis=0)
     boundaries = np.full(W, -1, dtype=np.float64)
 
-    # 4. Per-column top-down edge extraction
+    # 4. Per-column top-down edge extraction (Capped at first Canny ridge edge)
     for col in range(W):
         sky_rows = np.where(top_sky[:, col] == 1)[0]
         if len(sky_rows) == 0:
             continue
-        max_sky_row = sky_rows[-1]
+
+        # Find first gap in sky region
+        diffs = np.diff(sky_rows)
+        gaps = np.where(diffs > 3)[0]
+        max_sky_row = sky_rows[gaps[0]] if len(gaps) > 0 else sky_rows[-1]
+
+        # BARRIER: Stop at Canny edge ONLY if it is near U-Net mountain boundary (skip clouds)
+        if canny_edges is not None:
+            edge_rows = np.where(canny_edges[:, col])[0]
+            # Only edges within 20px of U-Net boundary (ignores high clouds)
+            valid_mountain_edges = [r for r in edge_rows if abs(r - max_sky_row) <= 20]
+            if len(valid_mountain_edges) > 0:
+                max_sky_row = valid_mountain_edges[0]
 
         boundary = float(max_sky_row)
-        found_edge = False
 
+        # 1. Search Canny ONLY in narrow +/-10px window around U-Net edge (stop cloud jumping)
         if use_canny and canny_edges is not None:
-            canny_rows = np.where(canny_edges[:max_sky_row + 1, col])[0]
-            if len(canny_rows) > 0:
-                for r0 in canny_rows:
-                    if r0 < H - 1 and vgrad_gray[r0, col] <= 0:
-                        if 1 <= r0 < H - 2:
-                            gm1 = float(vgrad_gray[r0 - 1, col])
-                            g0 = float(vgrad_gray[r0, col])
-                            gp1 = float(vgrad_gray[r0 + 1, col])
-                            denom = 2.0 * (gp1 - 2.0 * g0 + gm1)
-                            if abs(denom) > 1e-6:
-                                sub_offset = -(gp1 - gm1) / denom
-                                boundary = float(r0) + np.clip(sub_offset, -0.5, 0.5)
-                            else:
-                                boundary = float(r0)
-                        else:
-                            boundary = float(r0)
-                        found_edge = True
-                        break
-
-        if not found_edge and use_lab_b and b_vgrad is not None and max_sky_row > 5:
-            win = b_vgrad[:max_sky_row, col]
-            if len(win) > 0:
-                boundary = float(np.argmin(win))
+            win_start = max(0, int(max_sky_row) - 10)
+            win_end = min(H - 1, int(max_sky_row) + 10)
+            canny_in_win = np.where(canny_edges[win_start:win_end + 1, col])[0]
+            if len(canny_in_win) > 0:
+                candidate_rows = win_start + canny_in_win
+                best_r = candidate_rows[np.argmin(np.abs(candidate_rows - max_sky_row))]
+                boundary = float(best_r)
 
         boundaries[col] = boundary
 
@@ -191,14 +198,11 @@ def refine_sky_mask_with_guidance(
                 valid_vals = valid_vals[keep]
 
         boundaries = np.interp(all_cols, valid_cols, valid_vals)
-        if kernel_size > 1:
-            boundaries = _median_filter_1d(boundaries, kernel_size=kernel_size)
 
-        max_jump = 3.0
-        for c in range(1, W):
-            delta = boundaries[c] - boundaries[c - 1]
-            if abs(delta) > max_jump:
-                boundaries[c] = boundaries[c - 1] + np.sign(delta) * max_jump
+        # 2. Strong 1D Median + Gaussian Smoothing to eliminate sawtooth jitter
+        boundaries = _median_filter_1d(boundaries, kernel_size=9)
+        boundaries_2d = cv2.GaussianBlur(boundaries.reshape(1, -1).astype(np.float32), (7, 1), 0)
+        boundaries = boundaries_2d.flatten()
 
     refined = np.zeros((H, W), dtype=np.uint8)
     for col in range(W):
@@ -207,19 +211,19 @@ def refine_sky_mask_with_guidance(
 
     return np.where(refined == 1, 0, 255).astype(np.uint8)
 
-def refine_multichannel_gradient_fusion(img_np, raw_unet_mask):
-    """Multi-channel gradient fusion: LAB b*, HSV Saturation, and Grayscale gradients."""
+
+def refine_multichannel_gradient_fusion(img_np, raw_unet_mask, use_clahe=False):
+    """Multi-channel gradient fusion with CLAHE dehazing: LAB b*, HSV Saturation, and Grayscale gradients."""
     H, W = raw_unet_mask.shape
     if H == 0 or W == 0:
         return np.zeros((H, W), dtype=np.uint8)
 
     sky1 = (raw_unet_mask == 0).astype(np.uint8)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        sky1, connectivity=8
-    )
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky1, connectivity=8)
     top_sky = np.zeros((H, W), dtype=np.uint8)
+    top_limit = max(10, int(H * 0.10))
     for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_TOP] == 0 and stats[i, cv2.CC_STAT_AREA] > 100:
+        if stats[i, cv2.CC_STAT_TOP] <= top_limit and stats[i, cv2.CC_STAT_AREA] > 100:
             top_sky[labels == i] = 1
 
     lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
@@ -230,8 +234,11 @@ def refine_multichannel_gradient_fusion(img_np, raw_unet_mask):
     sat = cv2.GaussianBlur(hsv[:, :, 1].astype(np.float32), (3, 3), 0)
     s_vgrad = np.diff(sat, axis=0)
 
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    if use_clahe:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+    gray_blur = cv2.GaussianBlur(gray.astype(np.float32), (3, 3), 0)
     g_vgrad = np.diff(gray_blur, axis=0)
 
     fused_vgrad = 0.5 * b_vgrad + 0.3 * s_vgrad + 0.2 * g_vgrad
@@ -264,8 +271,9 @@ def refine_multichannel_gradient_fusion(img_np, raw_unet_mask):
 
     return np.where(refined == 1, 0, 255).astype(np.uint8)
 
-def refine_grayscale_fixed_window(img_np, raw_unet_mask, search_radius=25, kernel_size=7):
-    """Grayscale vertical-gradient refinement with fixed +/- search_radius row snapping."""
+
+def refine_grayscale_fixed_window(img_np, raw_unet_mask, search_radius=25, kernel_size=7, use_clahe=False):
+    """Grayscale vertical-gradient refinement with CLAHE dehazing and fixed +/- search_radius row snapping."""
     H, W = raw_unet_mask.shape
     if H == 0 or W == 0:
         return np.zeros((H, W), dtype=np.uint8)
@@ -273,12 +281,16 @@ def refine_grayscale_fixed_window(img_np, raw_unet_mask, search_radius=25, kerne
     sky1 = (raw_unet_mask == 0).astype(np.uint8)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky1, connectivity=8)
     top_sky = np.zeros((H, W), dtype=np.uint8)
+    top_limit = max(10, int(H * 0.10))
     for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_TOP] <= int(H * 0.10) and stats[i, cv2.CC_STAT_AREA] > 100:
+        if stats[i, cv2.CC_STAT_TOP] <= top_limit and stats[i, cv2.CC_STAT_AREA] > 100:
             top_sky[labels == i] = 1
 
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    if use_clahe:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+    blurred = cv2.GaussianBlur(gray.astype(np.float32), (3, 3), 0)
     vgrad = np.diff(blurred, axis=0)
 
     refined = np.zeros((H, W), dtype=np.uint8)
@@ -312,62 +324,6 @@ def refine_grayscale_fixed_window(img_np, raw_unet_mask, search_radius=25, kerne
     return np.where(refined == 1, 0, 255).astype(np.uint8)
 
 
-def refine_multichannel_gradient_fusion(img_np, raw_unet_mask):
-    """Multi-channel gradient fusion: LAB b*, HSV Saturation, and Grayscale gradients."""
-    H, W = raw_unet_mask.shape
-    if H == 0 or W == 0:
-        return np.zeros((H, W), dtype=np.uint8)
-
-    sky1 = (raw_unet_mask == 0).astype(np.uint8)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky1, connectivity=8)
-    top_sky = np.zeros((H, W), dtype=np.uint8)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_TOP] <= int(H * 0.10) and stats[i, cv2.CC_STAT_AREA] > 100:
-            top_sky[labels == i] = 1
-
-    lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
-    b_star = cv2.GaussianBlur(lab[:, :, 2].astype(np.float32), (3, 3), 0)
-    b_vgrad = np.diff(b_star, axis=0)
-
-    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-    sat = cv2.GaussianBlur(hsv[:, :, 1].astype(np.float32), (3, 3), 0)
-    s_vgrad = np.diff(sat, axis=0)
-
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    g_vgrad = np.diff(gray_blur, axis=0)
-
-    fused_vgrad = 0.5 * b_vgrad + 0.3 * s_vgrad + 0.2 * g_vgrad
-
-    boundaries = np.full(W, -1, dtype=np.int32)
-    for col in range(W):
-        sky_rows = np.where(top_sky[:, col] == 1)[0]
-        if len(sky_rows) == 0:
-            continue
-        boundary = sky_rows[-1]
-
-        search_min = max(0, boundary - 20)
-        search_max = min(H - 2, boundary + 20)
-        win = fused_vgrad[search_min:search_max, col]
-        if len(win) > 0:
-            boundary = search_min + int(np.argmin(win))
-
-        boundaries[col] = boundary
-
-    valid = boundaries >= 0
-    if np.any(valid):
-        all_cols = np.arange(W)
-        boundaries = np.interp(all_cols, all_cols[valid], boundaries[valid])
-        boundaries = _median_filter_1d(boundaries, kernel_size=5)
-
-    refined = np.zeros((H, W), dtype=np.uint8)
-    for col in range(W):
-        b = int(np.clip(round(boundaries[col]), 0, H - 1))
-        refined[:b, col] = 1
-
-    return np.where(refined == 1, 0, 255).astype(np.uint8)
-
-
 def refine_dynamic_programming_skyline(img_np, raw_unet_mask, smoothness_penalty=2.0, max_step=5):
     """Skyline extraction using Dynamic Programming (Viterbi shortest-path cost search)."""
     H, W = raw_unet_mask.shape
@@ -377,8 +333,9 @@ def refine_dynamic_programming_skyline(img_np, raw_unet_mask, smoothness_penalty
     sky1 = (raw_unet_mask == 0).astype(np.uint8)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky1, connectivity=8)
     top_sky = np.zeros((H, W), dtype=np.uint8)
+    top_limit = max(10, int(H * 0.10))
     for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_TOP] <= int(H * 0.10) and stats[i, cv2.CC_STAT_AREA] > 100:
+        if stats[i, cv2.CC_STAT_TOP] <= top_limit and stats[i, cv2.CC_STAT_AREA] > 100:
             top_sky[labels == i] = 1
 
     if top_sky.sum() == 0:
@@ -433,6 +390,7 @@ def refine_dynamic_programming_skyline(img_np, raw_unet_mask, smoothness_penalty
         refined[:b, col] = 1
 
     return np.where(refined == 1, 0, 255).astype(np.uint8)
+
 
 def load_segmentation_model(model_path, device):
     """Load trained SMP U-Net model from checkpoint file."""
@@ -517,7 +475,7 @@ def segment_image(
     transform = transforms.Compose(
         [
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
     )
 

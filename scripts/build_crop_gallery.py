@@ -85,14 +85,15 @@ def generate_preview_b64(img_path, max_w=400):
             if len(nz) > 0:
                 mask[: nz[0], c] = 0
 
-    # Extract 1D continuous row boundary per column
-    col_nz = mask != 0
+    # Extract 1D sky boundary per column (Sky = 0, Terrain = 255)
     pts = []
     for c in range(max_w):
-        nz = np.where(col_nz[:, c])[0]
-        r = (nz[0] - 1) if len(nz) > 0 else 0
-        r = int(np.clip(r, 0, new_h - 1))
-        pts.append([c, r])
+        sky_rows = np.where(mask[:, c] == 0)[0]
+        if len(sky_rows) > 0:
+            r = sky_rows[-1]  # bottom-most sky row
+        else:
+            r = 0  # no sky, mountain at top
+        pts.append([c, int(r)])
 
     # Draw 100% SOLID CONTINUOUS 2PX CYAN LINE using cv2.polylines
     pts_arr = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
@@ -319,6 +320,21 @@ class GalleryHandler(http.server.BaseHTTPRequestHandler):
             deleted = True
         if meta_p.exists():
             os.remove(meta_p)
+
+        # Record filename in deleted_crops_log.json
+        log_p = CROPS_DIR / "deleted_crops_log.json"
+        deleted_list = []
+        if log_p.exists():
+            try:
+                with open(log_p) as f:
+                    deleted_list = json.load(f)
+            except Exception:
+                deleted_list = []
+
+        if filename not in deleted_list:
+            deleted_list.append(filename)
+            with open(log_p, "w") as f:
+                json.dump(deleted_list, f, indent=2)
 
         self.update_file_list()
         return {"ok": deleted}

@@ -138,8 +138,11 @@ def benchmark_post_processing_algorithms(model, sample_ids, annotations):
         "canny_direct",
         "lab_b_threshold",
         "grayscale_fixed_window",
+        "grayscale_fixed_clahe",
         "lab_b_subpixel_snap",
+        "lab_b_subpixel_clahe",
         "multichannel_gradient_fusion",
+        "multichannel_clahe",
         "dynamic_programming_skyline",
     ]
 
@@ -173,9 +176,12 @@ def benchmark_post_processing_algorithms(model, sample_ids, annotations):
         masks["baseline_raw_unet"] = raw_unet_mask
         masks["canny_direct"] = run_canny_direct(img)
         masks["lab_b_threshold"] = run_lab_b_threshold(img)
-        masks["grayscale_fixed_window"] = refine_grayscale_fixed_window(img, raw_unet_mask)
-        masks["lab_b_subpixel_snap"] = refine_sky_mask_with_guidance(img, raw_unet_mask)
-        masks["multichannel_gradient_fusion"] = refine_multichannel_gradient_fusion(img, raw_unet_mask)
+        masks["grayscale_fixed_window"] = refine_grayscale_fixed_window(img, raw_unet_mask, use_clahe=False)
+        masks["grayscale_fixed_clahe"] = refine_grayscale_fixed_window(img, raw_unet_mask, use_clahe=True)
+        masks["lab_b_subpixel_snap"] = refine_sky_mask_with_guidance(img, raw_unet_mask, use_clahe=False)
+        masks["lab_b_subpixel_clahe"] = refine_sky_mask_with_guidance(img, raw_unet_mask, use_clahe=True)
+        masks["multichannel_gradient_fusion"] = refine_multichannel_gradient_fusion(img, raw_unet_mask, use_clahe=False)
+        masks["multichannel_clahe"] = refine_multichannel_gradient_fusion(img, raw_unet_mask, use_clahe=True)
         masks["dynamic_programming_skyline"] = refine_dynamic_programming_skyline(img, raw_unet_mask)
 
         for alg, m in masks.items():

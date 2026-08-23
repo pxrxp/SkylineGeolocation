@@ -24,15 +24,33 @@
       "mean_valid_cols": 204.8,
       "finite_samples": 8
     },
+    "grayscale_fixed_clahe": {
+      "mean_error_px": 424.02,
+      "median_error_px": 428.88,
+      "mean_valid_cols": 204.8,
+      "finite_samples": 8
+    },
     "lab_b_subpixel_snap": {
       "mean_error_px": 45.31,
       "median_error_px": 12.89,
       "mean_valid_cols": 449.9,
       "finite_samples": 18
     },
+    "lab_b_subpixel_clahe": {
+      "mean_error_px": 49.54,
+      "median_error_px": 16.04,
+      "mean_valid_cols": 449.9,
+      "finite_samples": 18
+    },
     "multichannel_gradient_fusion": {
       "mean_error_px": 428.15,
       "median_error_px": 432.31,
+      "mean_valid_cols": 210.0,
+      "finite_samples": 8
+    },
+    "multichannel_clahe": {
+      "mean_error_px": 427.92,
+      "median_error_px": 432.33,
       "mean_valid_cols": 210.0,
       "finite_samples": 8
     },
@@ -52,7 +70,7 @@
       "mean_error_px": 69.43,
       "median_error_px": 20.76,
       "mean_valid_cols": 449.5,
-      "elapsed_sec": 3.06
+      "elapsed_sec": 3.43
     },
     {
       "config_key": "input_size=256_tta=False_threshold=0.2",
@@ -62,7 +80,7 @@
       "mean_error_px": 62.31,
       "median_error_px": 20.76,
       "mean_valid_cols": 442.1,
-      "elapsed_sec": 3.13
+      "elapsed_sec": 3.53
     },
     {
       "config_key": "input_size=256_tta=False_threshold=0.3",
@@ -72,7 +90,7 @@
       "mean_error_px": 89.63,
       "median_error_px": 26.6,
       "mean_valid_cols": 447.6,
-      "elapsed_sec": 3.23
+      "elapsed_sec": 3.29
     },
     {
       "config_key": "input_size=256_tta=False_threshold=0.4",
@@ -82,7 +100,7 @@
       "mean_error_px": 90.7,
       "median_error_px": 26.6,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 3.18
+      "elapsed_sec": 3.55
     },
     {
       "config_key": "input_size=256_tta=False_threshold=0.5",
@@ -92,7 +110,7 @@
       "mean_error_px": 61.27,
       "median_error_px": 20.76,
       "mean_valid_cols": 449.8,
-      "elapsed_sec": 3.07
+      "elapsed_sec": 3.6
     },
     {
       "config_key": "input_size=256_tta=False_threshold=0.6",
@@ -102,7 +120,7 @@
       "mean_error_px": 46.26,
       "median_error_px": 12.89,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 3.16
+      "elapsed_sec": 3.5
     },
     {
       "config_key": "input_size=256_tta=False_threshold=0.7",
@@ -112,7 +130,7 @@
       "mean_error_px": 28.41,
       "median_error_px": 8.24,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 3.16
+      "elapsed_sec": 3.41
     },
     {
       "config_key": "input_size=256_tta=False_threshold=0.8",
@@ -122,7 +140,7 @@
       "mean_error_px": 28.41,
       "median_error_px": 8.24,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 3.31
+      "elapsed_sec": 3.47
     },
     {
       "config_key": "input_size=256_tta=False_threshold=0.9",
@@ -132,7 +150,7 @@
       "mean_error_px": 28.41,
       "median_error_px": 8.24,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 3.35
+      "elapsed_sec": 3.72
     },
     {
       "config_key": "input_size=256_tta=True_threshold=0.1",
@@ -142,7 +160,7 @@
       "mean_error_px": 89.54,
       "median_error_px": 20.76,
       "mean_valid_cols": 449.3,
-      "elapsed_sec": 3.97
+      "elapsed_sec": 4.16
     },
     {
       "config_key": "input_size=256_tta=True_threshold=0.2",
@@ -152,7 +170,7 @@
       "mean_error_px": 80.48,
       "median_error_px": 26.6,
       "mean_valid_cols": 406.3,
-      "elapsed_sec": 4.1
+      "elapsed_sec": 4.39
     },
     {
       "config_key": "input_size=256_tta=True_threshold=0.3",
@@ -162,7 +180,7 @@
       "mean_error_px": 43.14,
       "median_error_px": 12.89,
       "mean_valid_cols": 449.8,
-      "elapsed_sec": 4.16
+      "elapsed_sec": 4.31
     },
     {
       "config_key": "input_size=256_tta=True_threshold=0.4",
@@ -172,7 +190,7 @@
       "mean_error_px": 44.75,
       "median_error_px": 12.89,
       "mean_valid_cols": 449.8,
-      "elapsed_sec": 4.2
+      "elapsed_sec": 4.42
     },
     {
       "config_key": "input_size=256_tta=True_threshold=0.5",
@@ -182,7 +200,7 @@
       "mean_error_px": 45.31,
       "median_error_px": 12.89,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 4.26
+      "elapsed_sec": 4.25
     },
     {
       "config_key": "input_size=256_tta=True_threshold=0.6",
@@ -192,7 +210,7 @@
       "mean_error_px": 46.12,
       "median_error_px": 12.89,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 4.57
+      "elapsed_sec": 4.3
     },
     {
       "config_key": "input_size=256_tta=True_threshold=0.7",
@@ -202,7 +220,7 @@
       "mean_error_px": 45.6,
       "median_error_px": 12.89,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 4.48
+      "elapsed_sec": 4.32
     },
     {
       "config_key": "input_size=256_tta=True_threshold=0.8",
@@ -212,7 +230,7 @@
       "mean_error_px": 56.42,
       "median_error_px": 20.76,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 4.54
+      "elapsed_sec": 5.73
     },
     {
       "config_key": "input_size=256_tta=True_threshold=0.9",
@@ -222,7 +240,7 @@
       "mean_error_px": 28.41,
       "median_error_px": 8.24,
       "mean_valid_cols": 449.9,
-      "elapsed_sec": 4.66
+      "elapsed_sec": 5.59
     },
     {
       "config_key": "input_size=384_tta=False_threshold=0.1",
@@ -232,7 +250,7 @@
       "mean_error_px": 84.69,
       "median_error_px": 26.6,
       "mean_valid_cols": 449.3,
-      "elapsed_sec": 4.56
+      "elapsed_sec": 5.17
     },
     {
       "config_key": "input_size=384_tta=False_threshold=0.2",
@@ -242,7 +260,7 @@
       "mean_error_px": 112.92,
       "median_error_px": 31.37,
       "mean_valid_cols": 448.4,
-      "elapsed_sec": 4.41
+      "elapsed_sec": 5.14
     },
     {
       "config_key": "input_size=384_tta=False_threshold=0.3",
@@ -252,7 +270,7 @@
       "mean_error_px": 114.12,
       "median_error_px": 31.37,
       "mean_valid_cols": 446.2,
-      "elapsed_sec": 4.33
+      "elapsed_sec": 5.48
     },
     {
       "config_key": "input_size=384_tta=False_threshold=0.4",
@@ -262,7 +280,7 @@
       "mean_error_px": 105.8,
       "median_error_px": 31.37,
       "mean_valid_cols": 428.0,
-      "elapsed_sec": 4.54
+      "elapsed_sec": 5.92
     },
     {
       "config_key": "input_size=384_tta=False_threshold=0.5",
@@ -272,7 +290,7 @@
       "mean_error_px": 104.93,
       "median_error_px": 31.37,
       "mean_valid_cols": 446.1,
-      "elapsed_sec": 4.59
+      "elapsed_sec": 4.74
     },
     {
       "config_key": "input_size=384_tta=False_threshold=0.6",
@@ -282,7 +300,7 @@
       "mean_error_px": 91.61,
       "median_error_px": 31.37,
       "mean_valid_cols": 430.4,
-      "elapsed_sec": 4.43
+      "elapsed_sec": 4.04
     },
     {
       "config_key": "input_size=384_tta=False_threshold=0.7",
@@ -292,7 +310,7 @@
       "mean_error_px": 105.31,
       "median_error_px": 31.37,
       "mean_valid_cols": 446.8,
-      "elapsed_sec": 4.38
+      "elapsed_sec": 4.0
     },
     {
       "config_key": "input_size=384_tta=False_threshold=0.8",
@@ -302,7 +320,7 @@
       "mean_error_px": 89.72,
       "median_error_px": 26.6,
       "mean_valid_cols": 448.0,
-      "elapsed_sec": 4.53
+      "elapsed_sec": 4.13
     },
     {
       "config_key": "input_size=384_tta=False_threshold=0.9",
@@ -312,7 +330,7 @@
       "mean_error_px": 90.13,
       "median_error_px": 26.6,
       "mean_valid_cols": 448.6,
-      "elapsed_sec": 4.56
+      "elapsed_sec": 4.21
     },
     {
       "config_key": "input_size=384_tta=True_threshold=0.1",
@@ -322,7 +340,7 @@
       "mean_error_px": 95.23,
       "median_error_px": 31.37,
       "mean_valid_cols": 448.4,
-      "elapsed_sec": 8.51
+      "elapsed_sec": 6.59
     },
     {
       "config_key": "input_size=384_tta=True_threshold=0.2",
@@ -332,7 +350,7 @@
       "mean_error_px": 83.31,
       "median_error_px": 26.6,
       "mean_valid_cols": 448.8,
-      "elapsed_sec": 9.34
+      "elapsed_sec": 6.7
     },
     {
       "config_key": "input_size=384_tta=True_threshold=0.3",
@@ -342,7 +360,7 @@
       "mean_error_px": 103.79,
       "median_error_px": 31.37,
       "mean_valid_cols": 443.5,
-      "elapsed_sec": 9.16
+      "elapsed_sec": 6.55
     },
     {
       "config_key": "input_size=384_tta=True_threshold=0.4",
@@ -352,7 +370,7 @@
       "mean_error_px": 107.46,
       "median_error_px": 31.37,
       "mean_valid_cols": 423.9,
-      "elapsed_sec": 8.88
+      "elapsed_sec": 6.9
     },
     {
       "config_key": "input_size=384_tta=True_threshold=0.5",
@@ -362,7 +380,7 @@
       "mean_error_px": 104.9,
       "median_error_px": 31.37,
       "mean_valid_cols": 445.4,
-      "elapsed_sec": 9.64
+      "elapsed_sec": 6.68
     },
     {
       "config_key": "input_size=384_tta=True_threshold=0.6",
@@ -372,7 +390,7 @@
       "mean_error_px": 105.26,
       "median_error_px": 31.37,
       "mean_valid_cols": 440.5,
-      "elapsed_sec": 9.47
+      "elapsed_sec": 6.81
     },
     {
       "config_key": "input_size=384_tta=True_threshold=0.7",
@@ -382,7 +400,7 @@
       "mean_error_px": 108.71,
       "median_error_px": 31.37,
       "mean_valid_cols": 445.2,
-      "elapsed_sec": 8.87
+      "elapsed_sec": 7.66
     },
     {
       "config_key": "input_size=384_tta=True_threshold=0.8",
@@ -392,7 +410,7 @@
       "mean_error_px": 96.48,
       "median_error_px": 31.37,
       "mean_valid_cols": 433.1,
-      "elapsed_sec": 9.11
+      "elapsed_sec": 7.07
     },
     {
       "config_key": "input_size=384_tta=True_threshold=0.9",
@@ -402,7 +420,7 @@
       "mean_error_px": 93.99,
       "median_error_px": 26.6,
       "mean_valid_cols": 434.8,
-      "elapsed_sec": 9.06
+      "elapsed_sec": 6.95
     }
   ]
 }
