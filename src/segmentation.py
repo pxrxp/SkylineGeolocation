@@ -199,7 +199,19 @@ def refine_sky_mask_with_guidance(
 
         boundaries = np.interp(all_cols, valid_cols, valid_vals)
 
-        # 2. Strong 1D Median + Gaussian Smoothing to eliminate sawtooth jitter
+        # 1. Two-pass physical slope constraint (Max 2px/col slope - kills cloud cliff steps)
+        max_slope = 2.0
+        for c in range(1, W):
+            delta = boundaries[c] - boundaries[c - 1]
+            if abs(delta) > max_slope:
+                boundaries[c] = boundaries[c - 1] + np.sign(delta) * max_slope
+
+        for c in range(W - 2, -1, -1):
+            delta = boundaries[c] - boundaries[c + 1]
+            if abs(delta) > max_slope:
+                boundaries[c] = boundaries[c + 1] + np.sign(delta) * max_slope
+
+        # 2. Restored Gaussian Blur for smooth natural mountain profile
         boundaries = _median_filter_1d(boundaries, kernel_size=9)
         boundaries_2d = cv2.GaussianBlur(boundaries.reshape(1, -1).astype(np.float32), (7, 1), 0)
         boundaries = boundaries_2d.flatten()

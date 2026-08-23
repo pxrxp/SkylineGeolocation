@@ -2,6 +2,7 @@
 """Zero-Labor AI Skyline Server (Direct-Scribble Contour Engine).
 
 Fixes:
+  - Multi-Directory Image Resolver: Finds crops in both data/street_view/gsv_crops/ and images/
   - Direct-Scribble Path Replacement: Your hand-drawn scribble directly shapes 
     the skyline (snapping to nearby edges) and NEVER produces straight horizontal lines.
   - Storm-Cloud Resistant Feature Map: Uses CLAHE + Multi-Scale Sobel Texture 
@@ -9,7 +10,7 @@ Fixes:
   - Smooth Boundary Blending: Seamlessly merges scribble updates with existing line.
 
 Usage:
-  python scripts/annotate_gsv.py [--port 8787] [--host 127.0.0.1] [--limit 30]
+  python scripts/annotate_gsv.py [--port 8787] [--host 127.0.0.1] [--limit 1000] [--multi-only]
 """
 
 import argparse
@@ -19,6 +20,7 @@ import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
 import cv2
@@ -28,6 +30,7 @@ from scipy.ndimage import gaussian_filter1d
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMAGES_DIR = os.path.join(ROOT, "data/street_view/images")
+CROPS_DIR = os.path.join(ROOT, "data/street_view/gsv_crops")
 MASKS_DIR = os.path.join(ROOT, "data/street_view/masks")
 ANNOT_FILE = os.path.join(ROOT, "data/street_view/annotations.json")
 GT_FILE = os.path.join(ROOT, "data/street_view/ground_truth.json")
@@ -45,6 +48,18 @@ STATE = {
 }
 
 
+def find_image_path(sid):
+    """Find image path in gsv_crops/ or images/ with any supported image extension."""
+    for folder in [CROPS_DIR, IMAGES_DIR]:
+        if not os.path.exists(folder):
+            continue
+        for ext in [".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"]:
+            p = os.path.join(folder, sid + ext)
+            if os.path.exists(p):
+                return p
+    return None
+
+
 def safe_load_json(file_path, default_value):
     """Loads a JSON file safely, recovering automatically if empty or corrupted."""
     if not os.path.exists(file_path):
@@ -60,17 +75,68 @@ def safe_load_json(file_path, default_value):
         return default_value
 
 
-def load_state(limit):
-    """Safely loads ground truth and annotations."""
+def load_state(limit, multi_only=False):
+    """Safely loads ground truth and annotations, preserving existing annotations."""
     gt = safe_load_json(GT_FILE, {})
-    sids = list(gt.keys())
-    if limit:
-        sids = sids[:limit]
-    STATE["sids"] = sids
 
     annot_data = safe_load_json(ANNOT_FILE, {"annotations": {}, "skipped": {}})
     STATE["annotations"] = annot_data.get("annotations", {})
     STATE["skipped"] = annot_data.get("skipped", {})
+
+    all_sids = []
+
+    # Scan gsv_crops directory
+    if os.path.exists(CROPS_DIR):
+        for f in sorted(os.listdir(CROPS_DIR)):
+            if f.lower().endswith((".png", ".jpg", ".jpeg")):
+                stem = Path(f).stem
+                if stem not in all_sids:
+                    all_sids.append(stem)
+
+    # Scan images directory
+    if os.path.exists(IMAGES_DIR):
+        for f in sorted(os.listdir(IMAGES_DIR)):
+            if f.lower().endswith((".png", ".jpg", ".jpeg")):
+                stem = Path(f).stem
+                if stem not in all_sids:
+                    all_sids.append(stem)
+
+    # Add ground truth keys if missing
+    for k in gt.keys():
+        if k not in all_sids:
+            all_sids.append(k)
+
+    # Group by pano_id
+    pano_map = {}
+    if os.path.exists(CROPS_DIR):
+        for f in sorted(os.listdir(CROPS_DIR)):
+            if f.endswith(".json") and not f.startswith("crop_") and not f.startswith("deleted_") and f != "annotations.json":
+                meta = safe_load_json(os.path.join(CROPS_DIR, f), {})
+                pid = meta.get("pano_id")
+                stem = meta.get("filename", "").replace(".png", "").replace(".jpg", "").replace(".jpeg", "")
+                if pid and stem:
+                    pano_map.setdefault(pid, []).append(stem)
+
+    if multi_only and pano_map:
+        multi_sids = []
+        for pid, stems in pano_map.items():
+            if len(stems) >= 2:
+                for s in stems:
+                    if s in all_sids and s not in multi_sids:
+                        multi_sids.append(s)
+        sids = multi_sids if multi_sids else all_sids
+    else:
+        sids = all_sids
+
+    # Unannotated sids first so dashboard queue starts with fresh crops
+    unannotated = [s for s in sids if s not in STATE["annotations"] and s not in STATE["skipped"]]
+    annotated = [s for s in sids if s in STATE["annotations"] or s in STATE["skipped"]]
+    final_sids = unannotated + annotated
+
+    if limit and limit < len(final_sids):
+        final_sids = final_sids[:limit]
+
+    STATE["sids"] = final_sids
 
 
 def save_state():
@@ -197,8 +263,8 @@ def extract_pure_image_baseline_skyline(img_rgb):
 
 
 def load_line(sid):
-    p_img = os.path.join(IMAGES_DIR, sid + ".png")
-    if os.path.exists(p_img):
+    p_img = find_image_path(sid)
+    if p_img and os.path.exists(p_img):
         try:
             img_rgb = np.array(Image.open(p_img).convert("RGB"))
             return extract_pure_image_baseline_skyline(img_rgb)
@@ -239,10 +305,10 @@ def push_hist(sid):
 def pop_hist(sid):
     hist = STATE["hist"].get(sid, [])
     if hist:
-        STATE["lines"][sid] = hist.pop()
+        restored_line = hist.pop()
+        set_line_and_sync_mask(sid, restored_line)
         return True
     return False
-
 
 def magic_scribble_snap(img_rgb, current_line, points, radius=30):
     """Direct-Scribble Contour Engine: Snaps locally to physical edges along your drawn path."""
@@ -271,9 +337,9 @@ def magic_scribble_snap(img_rgb, current_line, points, radius=30):
     # Compute robust feature map
     feature_map, _, _ = compute_enhanced_skyline_feature_map(img_rgb)
 
-    # Local edge-snapping along the user's stroke
+    # Local edge-snapping along the user's stroke (Wide search band for easy snapping)
     snapped_y = scribble_y.copy()
-    search_radius = max(18, int(radius * 0.7))
+    search_radius = max(45, int(radius * 1.5))
 
     for idx, col in enumerate(scribble_cols):
         target_y = int(scribble_y[idx])
@@ -281,9 +347,9 @@ def magic_scribble_snap(img_rgb, current_line, points, radius=30):
         y_end = min(H_img - 1, target_y + search_radius)
 
         edge_strip = feature_map[y_start : y_end + 1, col]
-        if len(edge_strip) > 0 and edge_strip.max() > 0.12:
+        if len(edge_strip) > 0 and edge_strip.max() > 0.08:
             local_rows = np.arange(y_start, y_end + 1)
-            dist_penalty = 0.003 * ((local_rows - target_y) ** 2)
+            dist_penalty = 0.001 * ((local_rows - target_y) ** 2)
             score = edge_strip - dist_penalty
             best_local_y = local_rows[np.argmax(score)]
             snapped_y[idx] = best_local_y
@@ -301,34 +367,191 @@ def magic_scribble_snap(img_rgb, current_line, points, radius=30):
     updated_line = gaussian_filter1d(updated_line.astype(np.float64), sigma=0.8)
     return np.clip(np.round(updated_line), 0, H_img - 1).astype(np.int32)
 
+STATE["masks"] = {}
+
+def mask_for(sid):
+    """Retrieve 2D binary mask array (0=sky, 255=terrain)."""
+    if sid not in STATE["masks"]:
+        line = line_for(sid)
+        rr = np.arange(H)[:, None]
+        sky = rr < line[None, :]
+        STATE["masks"][sid] = np.where(sky, 0, 255).astype(np.uint8)
+    return STATE["masks"][sid]
+
+def mask_to_line(mask2d):
+    """Extract skyline boundary line from 2D mask."""
+    line = np.zeros(W, dtype=np.int32)
+    for c in range(W):
+        sky_rows = np.where(mask2d[:, c] == 0)[0]
+        line[c] = sky_rows[-1] if len(sky_rows) > 0 else 0
+    return line
+
+def set_line_and_sync_mask(sid, new_line):
+    """Update line and regenerate 2D mask overlay to stay in 100% sync."""
+    STATE["lines"][sid] = new_line
+    rr = np.arange(H)[:, None]
+    sky = rr < new_line[None, :]
+    STATE["masks"][sid] = np.where(sky, 0, 255).astype(np.uint8)
+
+def set_mask_and_sync_line(sid, new_mask2d):
+    """Update 2D mask and extract skyline line to stay in 100% sync."""
+    STATE["masks"][sid] = new_mask2d
+    STATE["lines"][sid] = mask_to_line(new_mask2d)
+
+def apply_2d_manual_brush(mask2d, points, tool, radius):
+    """Paint 2D filled circle directly onto the image mask."""
+    if not points:
+        return mask2d.copy()
+
+    H_img, W_img = mask2d.shape
+    updated_mask = mask2d.copy()
+    fill_val = 0 if tool == "sky_brush" else 255
+
+    for px, py in points:
+        cx = int(round(px))
+        cy = int(round(py))
+        R = max(3, int(radius))
+
+        y_min = max(0, cy - R)
+        y_max = min(H_img - 1, cy + R)
+        x_min = max(0, cx - R)
+        x_max = min(W_img - 1, cx + R)
+
+        if x_max < x_min or y_max < y_min:
+            continue
+
+        yy, xx = np.ogrid[y_min : y_max + 1, x_min : x_max + 1]
+        dist_sq = (xx - cx) ** 2 + (yy - cy) ** 2
+        circle_mask = dist_sq <= R**2
+
+        updated_mask[y_min : y_max + 1, x_min : x_max + 1][circle_mask] = fill_val
+
+    return updated_mask
+
+# def apply_point_constraint(img_rgb, current_line, click_x, click_y, label, radius=35):
+#     """Re-evaluate skyline locally around click_x, forcing click_y as sky or terrain."""
+#     H_img, W_img, _ = img_rgb.shape
+#     click_x = int(np.clip(click_x, 0, W_img - 1))
+#     click_y = int(np.clip(click_y, 0, H_img - 1))
+
+#     r_col = max(15, int(radius))
+#     c_min = max(0, click_x - r_col)
+#     c_max = min(W_img - 1, click_x + r_col)
+
+#     feature_map, _, _ = compute_enhanced_skyline_feature_map(img_rgb)
+
+#     local_cols = np.arange(c_min, c_max + 1)
+#     local_target = current_line[c_min : c_max + 1].copy().astype(np.float64)
+
+#     target_y_at_click = max(click_y, current_line[click_x]) if label == "sky" else min(click_y, current_line[click_x])
+
+#     for idx, col in enumerate(local_cols):
+#         dist = abs(col - click_x)
+#         w = max(0.0, 1.0 - (dist / float(r_col)))
+#         local_target[idx] = (1.0 - w) * local_target[idx] + w * target_y_at_click
+
+#     updated_local = local_target.copy()
+#     for idx, col in enumerate(local_cols):
+#         ty = int(local_target[idx])
+#         y0 = max(0, ty - 12)
+#         y1 = min(H_img - 1, ty + 12)
+#         strip = feature_map[y0 : y1 + 1, col]
+#         if len(strip) > 0 and strip.max() > 0.10:
+#             best_y = y0 + np.argmax(strip)
+#             updated_local[idx] = best_y
+
+#     if label == "sky":
+#         updated_local[click_x - c_min] = max(updated_local[click_x - c_min], click_y)
+#     else:
+#         updated_local[click_x - c_min] = min(updated_local[click_x - c_min], click_y)
+
+#     snapped_smooth = gaussian_filter1d(updated_local, sigma=1.0)
+#     updated_line = current_line.copy()
+#     updated_line[c_min : c_max + 1] = np.clip(np.round(snapped_smooth), 0, H_img - 1).astype(np.int32)
+#     return updated_line
+
+def apply_manual_paint_brush(current_line, points, tool, radius):
+    """Pure manual blob painting (zero edge-snapping, zero smoothing)."""
+    if not points:
+        return current_line.copy()
+
+    H_img, W_img = H, W
+    updated_line = current_line.copy()
+
+    for px, py in points:
+        cx = int(np.clip(px, 0, W_img - 1))
+        cy = int(np.clip(py, 0, H_img - 1))
+        R = max(3, int(radius))
+
+        x_min = max(0, cx - R)
+        x_max = min(W_img - 1, cx + R)
+
+        for x in range(x_min, x_max + 1):
+            dy = int(np.sqrt(max(0, R**2 - (x - cx)**2)))
+            if tool == "sky_brush":
+                target_y = int(np.clip(cy + dy, 0, H_img - 1))
+                updated_line[x] = max(updated_line[x], target_y)
+            else:  # terrain_brush
+                target_y = int(np.clip(cy - dy, 0, H_img - 1))
+                updated_line[x] = min(updated_line[x], target_y)
+
+    return updated_line
+
+# def apply_scribble_brush(sid, points, tool, radius):
+#     """Applies Magic Scribble Guide."""
+#     push_hist(sid)
+#     line = line_for(sid)
+
+#     img_path = find_image_path(sid)
+#     if img_path and os.path.exists(img_path):
+#         img_rgb = np.array(Image.open(img_path).convert("RGB"))
+#         STATE["lines"][sid] = magic_scribble_snap(
+#             img_rgb,
+#             line,
+#             points=points,
+#             radius=radius,
+#         )
 
 def apply_scribble_brush(sid, points, tool, radius):
-    """Applies ✨ Magic Scribble Guide."""
+    """Applies Scribble Guide, Sky Point, or Terrain Point constraint."""
     push_hist(sid)
     line = line_for(sid)
 
     img_path = os.path.join(IMAGES_DIR, sid + ".png")
+    crops_dir = os.path.join(ROOT, "data/street_view/gsv_crops")
+    if not os.path.exists(img_path) and os.path.exists(crops_dir):
+        p_crop = os.path.join(crops_dir, sid + ".png")
+        if os.path.exists(p_crop):
+            img_path = p_crop
+
     if os.path.exists(img_path):
         img_rgb = np.array(Image.open(img_path).convert("RGB"))
-        STATE["lines"][sid] = magic_scribble_snap(
-            img_rgb,
-            line,
-            points=points,
-            radius=radius,
-        )
-
-
+        mask2d = mask_for(sid)
+        if tool in ("sky_brush", "terrain_brush"):
+            updated_mask = apply_2d_manual_brush(
+                mask2d, points=points, tool=tool, radius=radius
+            )
+            set_mask_and_sync_line(sid, updated_mask)
+        else:
+            new_line = magic_scribble_snap(
+                img_rgb, line, points=points, radius=radius
+            )
+            set_line_and_sync_mask(sid, new_line)
+            
 def line_to_points(line, step=1):
     return [[int(c), int(line[c])] for c in range(0, W, step)]
 
 
 def render_view_mode_png(sid, view_mode, line):
     """Serves requested inspection layer: dehazed photo, LAB b*, CLAHE edge, or overlay tint."""
-    img_path = os.path.join(IMAGES_DIR, sid + ".png")
-    if not os.path.exists(img_path):
+    img_path = find_image_path(sid)
+    if not img_path or not os.path.exists(img_path):
         return ""
 
     img_rgb = np.array(Image.open(img_path).convert("RGB"))
+
+    if view_mode == "original":
+        return ""
 
     if view_mode == "dehazed":
         dehazed = dark_channel_prior_dehaze(img_rgb, omega=0.80)
@@ -352,13 +575,13 @@ def render_view_mode_png(sid, view_mode, line):
         return base64.b64encode(buf.getvalue()).decode()
 
     # Default mask overlay tint
-    rr = np.arange(H)[:, None]
-    sky = rr < line[None, :]
+    mask2d = mask_for(sid)
+    sky = mask2d == 0
 
     rgba = np.zeros((H, W, 4), dtype=np.uint8)
-    rgba[sky, 0:3] = (30, 110, 255)
-    rgba[sky, 3] = 75
-    rgba[~sky, 0:3] = (255, 140, 20)
+    rgba[sky, 0:3] = (30, 110, 255)    # Blue Sky
+    rgba[sky, 3] = 85
+    rgba[~sky, 0:3] = (255, 140, 20)  # Orange Terrain
     rgba[~sky, 3] = 60
 
     buf = io.BytesIO()
@@ -410,35 +633,54 @@ HTML = """<!doctype html>
   <div id="sub"></div>
   <div id="barwrap"><div id="bar"><div id="barfill"></div></div><span id="barprog"></span></div>
   
-  <div id="toolbar">
-    <button class="btn active" id="btn_scribble">✨ Magic Scribble Guide</button>
+<div id="toolbar">
+    <button class="btn active" id="btn_scribble">Scribble</button>
+    <button class="btn" id="btn_sky">Sky 🟦</button>
+    <button class="btn" id="btn_terrain">Terrain 🟥</button>
     <span style="color:#555">|</span>
-    <span style="font-size:12px; color:#aaa">Size:</span>
+    <span style="font-size:12px; color:#aaa">Brush:</span>
     <input type="range" id="brush_size" min="15" max="70" value="30">
     <span style="color:#555">|</span>
-    <span style="font-size:12px; color:#aaa">View Mode:</span>
-    <button class="btn view-btn active" id="view_tint">🎭 Tint Overlay</button>
-    <button class="btn view-btn" id="view_dehazed">🌫️ Dehazed Photo</button>
-    <button class="btn view-btn" id="view_lab">🎨 LAB b* Color Map</button>
-    <button class="btn view-btn" id="view_clahe">🔍 Edge Map</button>
+    <br/>
+    <span style="font-size:12px; color:#aaa">View:</span>
+    <button class="btn view-btn" id="view_original">Original Photo</button>
+    <button class="btn view-btn active" id="view_tint">Mask Overlay</button>
+    <button class="btn view-btn" id="view_dehazed">Dehazed</button>
+    <button class="btn view-btn" id="view_lab">Color Map</button>
+    <button class="btn view-btn" id="view_clahe">Edges</button>
     <span style="flex:1"></span>
-    <button class="btn" id="btn_undo">↩ Undo (u)</button>
+    <button class="btn" id="btn_undo">Undo (u)</button>
     <button class="btn" id="btn_reset">Reset (c)</button>
     <button class="btn primary" id="btn_save">Save + Next (s)</button>
     <button class="btn" id="btn_skip">Skip (n)</button>
   </div>
   
-  <div id="tip">✨ Magic Scribble Guide: Draw a quick rough stroke across any mountain section—AI shapes the ridge directly along your path!</div>
-  
+  <div id="tip">Draw a stroke across any mountain section to snap the skyline.</div>  
+
   <div id="imgwrap">
     <img id="img">
     <img id="tint">
+    <canvas id="live_canvas" width="1080" height="720" style="position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none;"></canvas>
     <svg id="svg"></svg>
   </div>
 
 <script>
 const img = document.getElementById('img'), svg = document.getElementById('svg'), tint = document.getElementById('tint');
 let cur = null, tool = 'scribble', viewMode = 'tint', pts = [], strokePts = [], busy = false, dragging = false;
+
+let cursorPos = [540, 360];
+
+function setTool(t) {
+  tool = t;
+  document.getElementById('btn_scribble').className = 'btn' + (t === 'scribble' ? ' active' : '');
+  document.getElementById('btn_sky').className = 'btn' + (t === 'sky_brush' ? ' active' : '');
+  document.getElementById('btn_terrain').className = 'btn' + (t === 'terrain_brush' ? ' active' : '');
+  render();
+}
+
+document.getElementById('btn_scribble').onclick = () => setTool('scribble');
+document.getElementById('btn_sky').onclick = () => setTool('sky_brush');
+document.getElementById('btn_terrain').onclick = () => setTool('terrain_brush');
 
 function pos(evt) {
   const r = img.getBoundingClientRect();
@@ -448,6 +690,8 @@ function pos(evt) {
 
 function render() {
   svg.innerHTML = '';
+
+  // 1. Current red skyline path
   if (pts.length > 1) {
     const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
     poly.setAttribute('points', pts.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' '));
@@ -456,21 +700,81 @@ function render() {
     poly.setAttribute('stroke-width', '2.5');
     svg.appendChild(poly);
   }
-  if (dragging && strokePts.length > 1) {
+
+  // 2. Active dashed blue scribble stroke line
+  if (tool === 'scribble' && dragging && strokePts.length > 1) {
     const stroke = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
     stroke.setAttribute('points', strokePts.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' '));
     stroke.setAttribute('fill', 'none');
     stroke.setAttribute('stroke', '#38bdf8');
-    stroke.setAttribute('stroke-width', '4');
+    stroke.setAttribute('stroke-width', '3.5');
     stroke.setAttribute('stroke-dasharray', '6 3');
     svg.appendChild(stroke);
   }
+
+  // 3. Circular brush cursor for Sky / Terrain brushes
+  if (tool === 'sky_brush' || tool === 'terrain_brush') {
+    const r = parseInt(document.getElementById('brush_size').value);
+    const circ = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    circ.setAttribute('cx', cursorPos[0]);
+    circ.setAttribute('cy', cursorPos[1]);
+    circ.setAttribute('r', r);
+    circ.setAttribute('fill', tool === 'sky_brush' ? 'rgba(30, 110, 255, 0.35)' : 'rgba(239, 68, 68, 0.35)');
+    circ.setAttribute('stroke', tool === 'sky_brush' ? '#38bdf8' : '#ef4444');
+    circ.setAttribute('stroke-width', '1.5');
+    svg.appendChild(circ);
+  }
 }
+
+const liveCanvas = document.getElementById('live_canvas');
+const ctx = liveCanvas.getContext('2d');
+
+function drawLiveBrush(p) {
+  if (tool !== 'sky_brush' && tool !== 'terrain_brush') return;
+  const r = parseInt(document.getElementById('brush_size').value);
+  ctx.beginPath();
+  ctx.arc(p[0], p[1], r, 0, 2 * Math.PI);
+  ctx.fillStyle = tool === 'sky_brush' ? 'rgba(30, 110, 255, 0.45)' : 'rgba(255, 140, 20, 0.45)';
+  ctx.fill();
+}
+
+svg.addEventListener('pointerdown', evt => {
+  svg.setPointerCapture(evt.pointerId);
+  dragging = true;
+  const p = pos(evt);
+  strokePts = [p];
+  if (tool === 'sky_brush' || tool === 'terrain_brush') {
+    drawLiveBrush(p);
+  }
+  render();
+});
+
+svg.addEventListener('pointermove', evt => {
+  cursorPos = pos(evt);
+  if (dragging) {
+    strokePts.push(cursorPos);
+    if (tool === 'sky_brush' || tool === 'terrain_brush') {
+      drawLiveBrush(cursorPos);
+    }
+  }
+  render();
+});
+
+svg.addEventListener('pointerup', evt => {
+  if (dragging) {
+    dragging = false;
+    ctx.clearRect(0, 0, 1080, 720); // Clear live canvas overlay after sync
+    const radius = parseInt(document.getElementById('brush_size').value);
+    sendAction('scribble_brush', {points: strokePts, tool: tool, radius: radius});
+    strokePts = [];
+  }
+});
 
 function setViewMode(v) {
   viewMode = v;
-  ['tint', 'dehazed', 'lab', 'clahe'].forEach(m => {
-    document.getElementById('view_' + m).className = 'btn view-btn' + (v === m ? ' active' : '');
+  ['tint', 'original', 'dehazed', 'lab', 'clahe'].forEach(m => {
+    const btn = document.getElementById('view_' + m);
+    if (btn) btn.className = 'btn view-btn' + (v === m ? ' active' : '');
   });
   if (cur) sendAction('view_mode', {view_mode: viewMode});
 }
@@ -499,14 +803,17 @@ svg.addEventListener('pointermove', evt => {
   }
 });
 
-svg.addEventListener('pointerup', () => {
-  if (dragging && strokePts.length > 1) {
+svg.addEventListener('pointerup', (evt) => {
+  if (dragging) {
     dragging = false;
     const radius = parseInt(document.getElementById('brush_size').value);
-    sendAction('scribble_brush', {points: strokePts, tool: 'scribble', radius: radius});
+    if (tool === 'sky_point' || tool === 'terrain_point') {
+      const clickPt = pos(evt);
+      sendAction('scribble_brush', {points: [clickPt], tool: tool, radius: radius});
+    } else if (strokePts.length > 1) {
+      sendAction('scribble_brush', {points: strokePts, tool: 'scribble', radius: radius});
+    }
     strokePts = [];
-  } else {
-    dragging = false;
   }
 });
 
@@ -518,6 +825,7 @@ window.addEventListener('keydown', evt => {
 });
 
 document.getElementById('view_tint').onclick = () => setViewMode('tint');
+document.getElementById('view_original').onclick = () => setViewMode('original');
 document.getElementById('view_dehazed').onclick = () => setViewMode('dehazed');
 document.getElementById('view_lab').onclick = () => setViewMode('lab');
 document.getElementById('view_clahe').onclick = () => setViewMode('clahe');
@@ -561,10 +869,11 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/":
             self._send(200, HTML.encode(), "text/html")
         elif u.path.startswith("/api/img/"):
-            sid = u.path[len("/api/img/") :].split(".")[0]
-            p = os.path.join(IMAGES_DIR, sid + ".png")
-            if os.path.exists(p):
-                self._send(200, open(p, "rb").read(), "image/png")
+            raw_filename = u.path[len("/api/img/") :]
+            sid = os.path.splitext(raw_filename)[0]
+            img_p = find_image_path(sid)
+            if img_p and os.path.exists(img_p):
+                self._send(200, open(img_p, "rb").read(), "image/png")
             else:
                 self._send(404, b"not found")
         elif u.path == "/api/next":
@@ -604,7 +913,8 @@ class Handler(BaseHTTPRequestHandler):
                 pop_hist(sid)
                 self._send(200, json.dumps(sample_payload(sid, view_mode=vm)).encode())
             elif u.path == "/api/reset":
-                STATE["lines"][sid] = load_line(sid)
+                init_line = load_line(sid)
+                set_line_and_sync_mask(sid, init_line)
                 STATE["hist"].pop(sid, None)
                 self._send(200, json.dumps(sample_payload(sid, view_mode=vm)).encode())
             elif u.path == "/api/annotate":
@@ -650,9 +960,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--limit", type=int, default=30)
+    ap.add_argument("--limit", type=int, default=1000)
+    ap.add_argument("--multi-only", action="store_true", help="Filter panos with multiple crops")
     args = ap.parse_args()
-    load_state(args.limit)
+    load_state(args.limit, multi_only=args.multi_only)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Direct-Scribble AI Server running at http://{args.host}:{args.port}")
     srv.serve_forever()
