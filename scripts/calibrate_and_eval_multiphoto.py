@@ -11,6 +11,7 @@ Usage:
   python scripts/calibrate_and_eval_multiphoto.py
 """
 
+import heapq
 import json
 import os
 import sys
@@ -75,8 +76,8 @@ def mask_from_points(points):
     return np.where(sky, 0, 255).astype(np.uint8)
 
 
-def fuse_and_calibrate_pano(crops, true_db_horizon, gt_data, bin_deg=0.5):
-    """Fuse crops into wide profile and calibrate global camera pitch."""
+def fuse_pano(crops, gt_data, bin_deg=0.5):
+    """Fuse crops into wide profile (no pitch calibration — done per-candidate)."""
     n_bins = int(round(360.0 / bin_deg))
     joint_profile = np.full(n_bins, np.nan, dtype=np.float32)
 
@@ -134,28 +135,20 @@ def fuse_and_calibrate_pano(crops, true_db_horizon, gt_data, bin_deg=0.5):
     valid_vals = joint_profile[valid_mask]
     fused_raw = np.interp(all_bins, valid_idx, valid_vals)
 
-    # Calibrate ONE global pitch offset for the entire fused panorama
-    best_corr_pitch = -np.inf
-    best_pitch = 0.0
-
-    for dp in np.arange(-15.0, 15.5, 0.5):
-        prof_p = fused_raw + dp
-        corr, _ = fft_prefilter(true_db_horizon[None, :], prof_p, bin_deg=bin_deg)
-        if float(corr[0]) > best_corr_pitch:
-            best_corr_pitch = float(corr[0])
-            best_pitch = dp
-
-    fused_calibrated = fused_raw + best_pitch
-    return fused_calibrated, cov_deg
+    return fused_raw, cov_deg
 
 
 def evaluate_run(multi_panos, gt_data, pq_file, lat_arr, lon_arr, bin_deg, n_bins):
-    """Fast vectorized evaluation using FFT cross-correlation (1.2s per pano)."""
-    print("\n--- RUNNING EVALUATION: Vectorized Fast FFT Multi-Photo Scan ---")
+    """Honest evaluation: per-candidate pitch calibration on top candidates."""
+    PITCH_OFFSETS = np.arange(-15.0, 15.5, 0.5)  # -15° to +15°
+    TOP_CANDIDATES = 100  # pitch-calibrate top 100 from coarse scan
+    COARSE_STRIDE = 12
+
+    print("\n--- RUNNING EVALUATION: Per-Candidate Pitch Calibration ---")
     results = []
     t0 = time.time()
 
-    for pid, crops in list(multi_panos.items())[:50]:
+    for pid, crops in list(multi_panos.items()):
         sid0 = crops[0]["sid"]
         gt_entry = gt_data.get(sid0) or gt_data.get(pid) or {}
         true_vp = gt_entry.get("closest_viewpoint_id")
@@ -166,27 +159,63 @@ def evaluate_run(multi_panos, gt_data, pq_file, lat_arr, lon_arr, bin_deg, n_bin
             continue
 
         true_vp = int(true_vp)
-        true_horizon = fetch_horizon(true_vp, pq_file)
 
-        fused_profile, cov_deg = fuse_and_calibrate_pano(
-            crops, true_horizon, gt_data, bin_deg=bin_deg
-        )
-        if fused_profile is None:
+        # Step 1: Fuse crops (NO pitch calibration)
+        fused_raw, cov_deg = fuse_pano(crops, gt_data, bin_deg=bin_deg)
+        if fused_raw is None:
             continue
 
-        best_corr = -np.inf
-        best_idx = -1
+        # Step 2: Coarse scan (stride=12) → top-N candidates
+        coarse_heap = []
         chunk_start = 0
-
         for batch in pq_file.iter_batches(batch_size=4000, columns=["raw_horizon_deg"]):
             chunk = decode_horizon_column(batch.to_pandas()["raw_horizon_deg"].to_numpy())
-            sub = chunk[::STRIDE]
-            corr, _ = fft_prefilter(sub, fused_profile, bin_deg)
-            k = int(np.argmax(corr))
-            if corr[k] > best_corr:
-                best_corr = float(corr[k])
-                best_idx = chunk_start + k * STRIDE
+            sub = chunk[::COARSE_STRIDE]
+            corr, _ = fft_prefilter(sub, fused_raw, bin_deg)
+            for k in range(len(sub)):
+                vp_idx = chunk_start + k * COARSE_STRIDE
+                c_val = float(corr[k])
+                if len(coarse_heap) < TOP_CANDIDATES:
+                    heapq.heappush(coarse_heap, (c_val, vp_idx, chunk[k * COARSE_STRIDE]))
+                elif c_val > coarse_heap[0][0]:
+                    heapq.heapreplace(coarse_heap, (c_val, vp_idx, chunk[k * COARSE_STRIDE]))
             chunk_start += len(chunk)
+        coarse_heap.sort(key=lambda x: -x[0])
+
+        # Step 3: Per-candidate pitch calibration on top candidates
+        best_corr = -np.inf
+        best_idx = -1
+        best_pitch = 0.0
+
+        for c_val, vp_idx, db_horiz in coarse_heap:
+            for dp in PITCH_OFFSETS:
+                prof_p = fused_raw + dp
+                corr, _ = fft_prefilter(db_horiz[None, :], prof_p, bin_deg=bin_deg)
+                c = float(corr[0])
+                if c > best_corr:
+                    best_corr = c
+                    best_idx = vp_idx
+                    best_pitch = dp
+
+        if best_idx < 0:
+            continue
+
+        # Step 4: Find true VP rank
+        true_rank = -1
+        for rank, (_, vp_idx, _) in enumerate(coarse_heap):
+            if vp_idx == true_vp:
+                true_rank = rank
+                break
+        # Also check if true VP was pitch-calibrated better
+        true_vp_pitch_corr = -np.inf
+        for c_val, vp_idx, db_horiz in coarse_heap:
+            if vp_idx == true_vp:
+                for dp in PITCH_OFFSETS:
+                    prof_p = fused_raw + dp
+                    corr, _ = fft_prefilter(db_horiz[None, :], prof_p, bin_deg=bin_deg)
+                    if float(corr[0]) > true_vp_pitch_corr:
+                        true_vp_pitch_corr = float(corr[0])
+                break
 
         err_m = geodesic((true_lat, true_lon), (lat_arr[best_idx], lon_arr[best_idx])).meters
 
@@ -196,13 +225,17 @@ def evaluate_run(multi_panos, gt_data, pq_file, lat_arr, lon_arr, bin_deg, n_bin
             "coverage_deg": float(cov_deg),
             "err_m": float(err_m),
             "best_corr": float(best_corr),
+            "best_pitch_deg": float(best_pitch),
+            "true_rank_coarse": true_rank,
         })
 
+        tag = "HIT " if err_m < 1000 else "MISS"
         print(
-            f"Pano {pid[:12]}: {len(crops)} crops | "
-            f"FOV: {cov_deg:.0f}° | "
-            f"Err: {err_m:6.0f}m | "
-            f"Corr: {best_corr:.3f} "
+            f"  [{tag}] {pid[:20]:20s} "
+            f"crops={len(crops)} FOV={cov_deg:.0f}° "
+            f"err={err_m:7.0f}m corr={best_corr:.3f} "
+            f"pitch={best_pitch:+.1f}° "
+            f"rank={true_rank} "
             f"[{time.time() - t0:.0f}s]"
         )
 
