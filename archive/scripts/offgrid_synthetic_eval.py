@@ -54,6 +54,7 @@ def load_db_coords():
 
 def pick_offgrid_positions(meta, n_samples, rng):
     px_w = abs(meta["px_w"])
+    px_h = meta["px_h"]  # negative: y decreases with row index
     start_x = meta["start_x"]
     start_y = meta["start_y"]
     dim0 = meta["dem_dim_0"]
@@ -63,7 +64,7 @@ def pick_offgrid_positions(meta, n_samples, rng):
     rows = rng.randint(margin, dim0 - margin, size=n_samples)
     cols = rng.randint(margin, dim1 - margin, size=n_samples)
     xs = start_x + cols * px_w + offset
-    ys = start_y + rows * px_w + offset
+    ys = start_y + rows * px_h + offset
     return xs, ys, rows, cols
 
 
@@ -77,8 +78,9 @@ def render_horizons_at_positions(vert_grid, meta, xs, ys, n_bins=N_BINS):
     start_y = meta["start_y"]
     dim0 = meta["dem_dim_0"]
     dim1 = meta["dem_dim_1"]
+    px_h = meta["px_h"]  # negative: y decreases with row index
     cols = np.clip(np.round((xs - start_x) / px_w).astype(int), 0, dim1 - 1)
-    rows = np.clip(np.round((ys - start_y) / px_w).astype(int), 0, dim0 - 1)
+    rows = np.clip(np.round((ys - start_y) / px_h).astype(int), 0, dim0 - 1)
     # z is every 3rd element starting at index 2, first dim0*dim1 vertices
     idx = (rows * dim1 + cols) * 3 + 2
     zs = vert_grid[idx].astype(np.float32)
