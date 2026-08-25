@@ -22,10 +22,10 @@ import pyarrow.parquet as pq
 from pathlib import Path
 from geopy.distance import geodesic
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT / "src"))
 from query_profile import extract_elevation_profile
 
-ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "notebooks" / "02_SkylineDatabase" / "output" / "skyline_db.parquet"
 GT_FILE = ROOT / "data" / "street_view" / "ground_truth.json"
 ANNOT_FILE = ROOT / "data" / "street_view" / "gsv_annotations.json"

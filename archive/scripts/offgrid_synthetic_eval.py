@@ -34,10 +34,9 @@ import pyarrow.parquet as pq
 from pathlib import Path
 from geopy.distance import geodesic
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT / "src"))
 from horizon_format import decode_horizon_column
-
-ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "notebooks" / "02_SkylineDatabase" / "output" / "skyline_db.parquet"
 BIN_DEG = 0.5
 
