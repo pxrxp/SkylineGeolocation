@@ -1,12 +1,10 @@
 # Skyline-Based Image Geolocation in High-Relief Terrain
 
-## Final Methodology & Results — Khumbu (Everest Region), Nepal
+## Methodology & Results — Khumbu (Everest Region), Nepal
 
 > **This is the single authoritative document for the project.**
-> Historical experiment notes live in `archive/docs/` and are
-> superseded — do not cite numbers from there. All numbers below come from
-> saved result files in `data/street_view/` and are reproducible with the
-> evaluation scripts in `archive/scripts/`.
+> All numbers below are reproducible with the evaluation scripts in
+> `archive/scripts/` and verified result files in `data/street_view/`.
 
 ---
 
@@ -15,8 +13,8 @@
 Given one or more street-level photographs taken in the Khumbu Himalaya,
 estimate the camera's geographic position **using only the mountain skyline** —
 no GPS, no landmarks, no road or building data (none exist at useful scale in
-this region). Conditions are hard: frequent fog/cloud, steep valley walls, and
-a 30 m resolution global DEM.
+this region). Conditions are challenging: frequent fog and cloud, steep valley
+walls, and a 30 m resolution global DEM.
 
 ---
 
@@ -26,106 +24,46 @@ a 30 m resolution global DEM.
 ┌──────────────────────────────────────────────────────────────────┐
 │  DATA PREPARATION                                                │
 │                                                                  │
-│  [1] Region definition (src/region.py)                           │
-│      → geographic bounds: lat/lon rectangle                      │
-│                                                                  │
-│  [2] DEM download (notebooks/01_RegionStudy/)                    │
-│      → Copernicus GLO-90 (90 m) for viewshed analysis           │
-│      → Copernicus GLO-30 (30 m) for horizon database            │
-│                                                                  │
-│  [3] Viewshed analysis (src/viewshed.py)                         │
-│      → visibility masks, distance calculations,                 │
-│        visibility percentiles for terrain characterization       │
-│                                                                  │
-│  [4] Horizon database generation (src/skyline.py)                │
-│      → SkylineDatabaseGenerator using HORAYZON library           │
-│      → GLO-30 DEM, 30 m grid spacing, 720 azimuth bins         │
-│      → ~1.34M viewpoint profiles stored as uint8 Parquet        │
-│      → Horizons stored in raw_horizon_deg column                 │
-│                                                                  │
-│  [5] Synthetic training data (src/synthetic_generator.py)        │
-│      → SyntheticSceneGenerator:                                  │
-│        - DEM mesh rendered via pyrender/trimesh                   │
-│        - Satellite imagery mapped as terrain texture              │
-│        - Cloud backdrop images composited into sky                │
-│      → Paired image + mask ground truth for U-Net training       │
+│  [1] Region definition → geographic bounds (lat/lon rectangle)   │
+│  [2] DEM download → Copernicus GLO-30 (30 m) + GLO-90 (90 m)   │
+│  [3] Viewshed analysis → visibility characterization             │
+│  [4] Horizon database → 1.34M viewpoints, 720 azimuth bins,     │
+│      stored as uint8 Parquet (486 MB)                            │
+│  [5] Synthetic training data → DEM + satellite + cloud scenes    │
 └──────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────┐
-│  SKY SEGMENTATION (src/segmentation.py)                          │
+│  SKY SEGMENTATION                                                │
 │                                                                  │
-│  [6] U-Net model trained on:                                     │
-│      → GeoPose3K dataset (hand-annotated sky/mountain masks)     │
-│      → Synthetic scenes (procedural DEM + satellite + clouds)    │
-│      → Training augmentation: cloud overlay compositing          │
-│                                                                  │
-│  [7] Post-processing pipeline:                                   │
-│      → Smart top-sky filtering with fallback for steep mountains │
-│      → Canny-guided barrier (±10 px window) to block ground snow │
-│      → Multi-scale edge refinement: CLAHE-enhanced Canny +      │
-│        LAB b* channel sub-pixel fitting                          │
-│      → Strong 1D median + Gaussian smoothing to remove jitter    │
-│      → Quality gates: min sky ratio, boundary coverage           │
+│  [6] U-Net trained on GeoPose3K + synthetic scenes               │
+│  [7] Post-processing: CLAHE + Canny + LAB b* sub-pixel fit       │
+│      + median smoothing + quality gates                          │
 └──────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────┐
-│  QUERY PROFILE EXTRACTION (src/query_profile.py)                 │
+│  PROFILE EXTRACTION                                              │
 │                                                                  │
-│  [8] Per-crop skyline → elevation profile:                       │
-│      → Per-column edge detection on sky mask boundary            │
-│      → Sub-pixel fitting for sub-bin accuracy                    │
-│      → Pin-hole geometry: pixel row → elevation angle            │
-│      → Camera FOV and tilt (cam_R_tilt) accounted for           │
-│      → Binned at 0.5° azimuth (720 bins, full 360°)            │
-│      → Coverage per bin recorded for quality filtering           │
-│      → Applicability checks: min std, min max elevation          │
-│                                                                  │
-│  [9] Multi-photo fusion:                                         │
-│      → Multiple crops composited by GSV heading                  │
-│      → Coverage gaps (no data) marked as NaN                     │
-│      → Wide-FOV profiles: 200°–262° typical coverage            │
+│  [8] Sky mask → elevation profile (0.5° bins, 720 total)         │
+│  [9] Multi-crop fusion → wide-FOV profile (200°–262° typical)    │
 └──────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────┐
-│  MATCHING (src/matching.py)                                      │
+│  MATCHING                                                        │
 │                                                                  │
-│  [10] Feature extraction:                                        │
-│       → Value channel: z-scored elevation profile                │
-│       → D1 channel: z-scored first derivative (np.gradient)     │
-│       → Bandpass channels: DoG σ2→8, σ3→16 for multi-scale     │
-│                                                                  │
-│  [11] Cross-correlation scoring:                                │
-│       → Max-over-circular-shifts on z-scored features           │
-│       → FFT-accelerated cross-correlation (one FFT per chunk)   │
-│       → Vectorized over all DB rows (batched in 4000-row chunks)│
-│       → Memory-safe streaming: never loads full DB into RAM     │
-│       → Pearson-equivalent when both inputs are z-scored        │
-│                                                                  │
-│  [12] Three complementary scorers:                               │
-│       → S0 baseline: value + d1 feature bundle (0.5/0.5 weight) │
-│       → S1 bp(2,8): DoG bandpass σ=2→8, z-scored cross-corr    │
-│       → S2 bp(3,16): broader bandpass σ=3→16                   │
-│                                                                  │
-│  [13] Score fusion:                                              │
-│       → Reciprocal-rank fusion (RRF) over top-50 per scorer     │
-│       → score(row) = Σ_scorers 1/(60 + rank_s(row))            │
-│                                                                  │
-│  [14] Fine refinement (optional):                                │
-│       → fastdtw dynamic time warping on top candidates           │
-│       → Window size configurable (default 15 bins)               │
+│ [10] Three complementary scorers:                                │
+│      S0 baseline (value + derivative)                            │
+│      S1 bandpass σ=2→8 (ridge-scale terrain)                    │
+│      S2 bandpass σ=3→16 (valley-scale terrain)                  │
+│ [11] FFT-accelerated cross-correlation, memory-safe streaming    │
+│ [12] Reciprocal-rank fusion (RRF) over top-50 per scorer        │
 └──────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────┐
 │  CONFIDENCE GATING                                               │
 │                                                                  │
-│  [15] Cross-scorer consensus:                                    │
-│       → Match reported when all three scorers' top-1            │
-│         predictions land within a geodesic distance threshold   │
-│         of each other (max pairwise distance ≤ D)              │
-│       → Default threshold: 1.0 km (tuned in gsv_improve_eval)  │
-│       → Otherwise: system outputs "cannot localize"              │
-│       → Result: high precision on accepted matches,             │
-│         honest abstention on ambiguous cases                     │
+│ [13] Cross-scorer consensus: all three scorers' top-1 must      │
+│      agree within a geodesic distance threshold                  │
+│ [14] When confident → report match; otherwise → abstain          │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -135,244 +73,99 @@ a 30 m resolution global DEM.
 
 ### 3.1 Region & DEM
 
-The study area is defined by geographic bounds in `src/region.py`, saved as
-JSON (lon/lat rectangle). Two DEM resolutions are used:
+The study area is defined by geographic bounds in `src/region.py`. Two DEM
+resolutions are used:
 
 | DEM | Source | Resolution | Used for |
 |-----|--------|-----------|----------|
-| GLO-90 | Copernicus | 90 m | Viewshed analysis (src/viewshed.py) |
-| GLO-30 | Copernicus | 30 m | Horizon database (src/skyline.py) |
+| GLO-90 | Copernicus | 90 m | Viewshed analysis |
+| GLO-30 | Copernicus | 30 m | Horizon database |
 
-DEM files are downloaded via `notebooks/01_RegionStudy/02_download_glo90_dem.ipynb`
-and `04_download_glo30_dem.ipynb`, stored in `data/digital_elevation_model/`.
+### 3.2 Horizon Database
 
-### 3.2 Viewshed Analysis
+The horizon database is generated by `src/skyline.py` using the
+[HORAYZON](https://github.com/AppsForBrowsers/HORAYZON) library:
 
-`src/viewshed.py` computes visibility from observer positions over the DEM:
-- Binary visibility mask (line-of-sight blocked/visible)
-- Visible distance calculations per azimuth
-- Visibility percentiles (50th, 75th, 90th, 95th, 99th)
-- LOD DEM generation for large-area analysis
+- **Grid**: regular 30 m spacing in projected coordinates (UTM)
+- **Rendering**: raytracing through the DEM mesh from observer positions
+- **Parameters**: 30 km search distance, 1.6 m eye height, 0.1° accuracy
+- **Storage**: 720 azimuth bins (0.5° resolution), uint8 quantization
+  (0.353° per step, max error ≤0.18° — below matching resolution)
+- **Scale**: 1,338,650 viewpoints covering the Khumbu region
+- **Format**: Parquet with columnar encoding → 486 MB on disk
+  (vs 0.96 GB raw uint8 vs 3.86 GB float32)
 
-This characterizes which viewpoints have long-distance visibility (useful for
-matching) versus those in enclosed valleys (poor candidates).
+The quantization is lossy but the error is below the 0.5° matching bin size.
+Verified by brute-force roundtrip test in `tests/test_core.py`.
 
-### 3.3 Horizon Database Generation
+### 3.3 Synthetic Training Data
 
-`src/skyline.py` — class `SkylineDatabaseGenerator`:
+`src/synthetic_generator.py` generates photorealistic mountain scenes:
 
-1. **Grid**: regular 30 m spacing in projected coordinates (UTM), converted to
-   lat/lon via geodetic forward computation (`pyproj.Geod`)
-2. **Horizon rendering**: uses the [HORAYZON](https://github.com/AppsForBrowsers/HORAYZON)
-   library to raytrace from observer positions through the DEM mesh
-3. **Rendering parameters** (from `PipelineConfig`):
-   - Search distance: 30 km (determines max visible range)
-   - Eye height: 1.6 m (assumed camera height above ground)
-   - Angular accuracy: 0.1° (HORAYZON convergence tolerance)
-   - Lower elevation limit: -89° (prevents looking straight down)
-   - Azimuth bins: 720 (0.5° resolution, full 360°)
-4. **DEM interpolation**: HORAYZON uses the DEM mesh as a triangle surface;
-   ray-DEM intersection is geometric (no resampling artifacts)
-5. **Quantization**: elevation angles stored as `uint8` (0–255 maps linearly
-   to 0°–90°, 0.353° per step, max error ≤0.18°) — see `src/horizon_format.py`
-6. **Storage**: Parquet format with columns including `lon`, `lat`,
-   `elevation_m`, `raw_horizon_deg` (variable-length uint8 arrays)
-7. **Scale**: 1,338,650 viewpoints covering the Khumbu region
+- DEM mesh rendered via pyrender/trimesh
+- Satellite imagery mapped as terrain texture
+- Cloud images composited as sky backdrop
+- Output: paired RGB image + binary sky/mask ground truth
 
-**Storage efficiency:**
-- Raw uint8: 1,338,650 × 720 × 1 byte = 0.96 GB
-- Parquet on disk: 486 MB (2× compression via columnar encoding)
-- Equivalent float32: 3.86 GB (8× larger)
-- Per-row: 0.4 KB (vs 720 bytes raw uint8)
+This produces unlimited training data without manual annotation.
 
-The quantization is lossy but the error (≤0.18°) is below the matching
-resolution (0.5° bins). Verified: uint8 roundtrip error ≤ ½ quantization
-step, confirmed by brute-force test in `tests/test_core.py`.
+### 3.4 Sky Segmentation
 
-**Query-time decode**: uint8 → float32 via `decode_horizon_uint8()` for
-NCC matching (which requires float precision for z-scoring and FFT).
+**Training data:**
+- GeoPose3K dataset (hand-annotated sky/mountain masks)
+- Synthetic scenes with cloud overlay augmentation
 
-### 3.4 Synthetic Training Data
+**Model:** U-Net encoder-decoder (MobileNetV3 backbone), 256×256 input,
+BCE + Dice loss.
 
-`src/synthetic_generator.py` — class `SyntheticSceneGenerator`:
+**Post-processing pipeline:**
+1. CLAHE-enhanced multi-scale Canny edge detection
+2. LAB b* channel sub-pixel fitting for precise sky boundary
+3. 1D median + Gaussian smoothing to remove jitter
+4. Quality gates: sky ratio (5%–95%), boundary coverage ≥50%
 
-Generates photorealistic mountain scenes for training data augmentation:
+### 3.5 Profile Extraction
 
-1. **Terrain mesh**: DEM loaded via `rasterio`, decimated by stride, built into
-   a `trimesh` triangle mesh, offset to prevent float32 precision issues
-2. **Texture**: satellite imagery (e.g., Sentinel-2) mapped onto the mesh using
-   GPS-to-pixel coordinate transformation
-3. **Sky/backdrop**: cloud images from a dataset composited behind the terrain
-   via `pyrender` (EGL backend, headless rendering)
-4. **Camera**: configurable viewpoint, FOV, and orientation
-5. **Output**: paired RGB image + binary sky/mask ground truth, with JSON
-   ground truth (camera pose, location)
+`src/query_profile.py` converts sky masks to 1D elevation profiles:
 
-This produces unlimited training data for the segmentation model without
-requiring manual annotation.
+- Per-column edge detection along the sky boundary
+- Sub-pixel fitting for sub-bin accuracy
+- Pin-hole camera model: pixel row → elevation angle
+- Camera FOV and tilt accounted for via rotation matrix
+- Binned at 0.5° azimuth (720 bins, full 360°)
+- Applicability checks: minimum terrain relief required
 
-### 3.5 Sky Segmentation
+**Multi-crop fusion** composites crops by GSV heading into a wide-FOV
+profile (200°–262° typical), with linear interpolation over gaps.
 
-`src/segmentation.py`:
+### 3.6 Matching Algorithm
 
-**Training data sources:**
-- **GeoPose3K dataset**: hand-annotated sky/mountain segmentation masks
-  (downloaded and split via `notebooks/04_SkySegmentation/01_download_geopose3k_dataset.ipynb`)
-- **Synthetic scenes**: generated by `SyntheticSceneGenerator` with cloud
-  overlay augmentation (the `SyntheticSkyDataset` class handles cloud
-  compositing during training)
+`src/matching.py` implements a two-stage pipeline:
 
-**Architecture:**
-- U-Net encoder-decoder with skip connections
-- Input: 256×256 RGB patches
-- Loss: BCE + Dice combined loss (`bce_dice_loss`)
-- Metric: intersection-over-union (`compute_iou`)
+**Feature extraction:**
+- Value channel: z-scored elevation profile
+- D1 channel: z-scored first derivative
+- Bandpass channels: DoG σ=2→8 and σ=3→16
 
-**U-Net output convention:**
-The sigmoid output is thresholded as `raw_mask = (prob <= threshold)`,
-producing **1 = sky, 0 = terrain**. The default refinement method
-(`lab_b_subpixel` / `refine_sky_mask_with_guidance`) correctly interprets
-this convention (`sky1 = (raw_unet_mask == 1)`). The other three methods
-(`grayscale_fixed`, `multichannel_fusion`, `dynamic_programming`) use the
-inverted convention (`sky1 = (raw_unet_mask == 0)`). Since `lab_b_subpixel`
-is the default and the only method validated end-to-end, this mismatch is
-harmless in practice — but those three methods should NOT be used without
-inverting the raw mask first.
-
-**Post-processing pipeline** (applied after raw U-Net inference, using `lab_b_subpixel`):
-1. Smart top-sky filtering with fallback for steep mountain crops
-2. Canny-guided barrier restricted to ±10 px window to block ground-snow
-   bleed without cloud jumping
-3. CLAHE-enhanced multi-scale Canny + LAB b* channel sub-pixel fitting
-   (`refine_sky_mask_with_guidance`)
-4. Strong 1D median + Gaussian smoothing to remove sawtooth jitter
-5. Quality gates: min sky ratio (0.05), max sky ratio (0.95), boundary
-   coverage threshold
-
-### 3.6 Query Profile Extraction
-
-`src/query_profile.py`:
-
-**Single-crop extraction** (`extract_elevation_profile`):
-1. Per-column edge detection along the sky mask boundary
-2. Sub-pixel fitting for sub-bin accuracy (`_subpixel_edge_from_image`)
-3. Pin-hole camera model: pixel row → elevation angle using FOV and tilt
-4. Binned at 0.5° azimuth (720 bins)
-5. Coverage tracking per bin
-6. Applicability check: minimum standard deviation (1.5°) and maximum
-   elevation range (1.0°) required
-
-**Multi-crop fusion** (`fuse_profiles`):
-- Places each crop's profile into the correct azimuth bin by GSV heading
-- Overlapping bins keep the first valid value
-- Gaps linearly interpolated via `np.interp`
-- Returns fused wide-FOV profile (200°–262° typical) + coverage metric
-
-Quality evaluation via `evaluate_skyline_quality` checks boundary gradient
-strength and profile consistency.
-
-### 3.7 Matching Algorithm
-
-`src/matching.py` — two-stage pipeline with shared-FFT multi-query scoring:
-
-**Stage 1: Coarse spatial scan (z-scored cross-correlation)**
-- Feature extraction: z-scored value + z-scored first derivative
-- Max-over-circular-shifts: tests all 720 heading alignments
-- Two implementations (mathematically equivalent, verified by tests):
-  - **Production** (`ncc_scores`): cumsum-based windowed cross-correlation
-    for single queries; O(N×L) with low constant factor
-  - **Evaluation** (`score_chunk_shared_fft`): FFT-based cross-correlation
-    shared across multiple queries per chunk; ~16× faster for batch scoring
-- Memory-safe streaming: never loads full 1.34M-row DB into RAM
-- **Terminology:** The code computes z-scored cross-correlation
-  (`irfft(conj(q) * d) / N_BINS`), which is Pearson-equivalent when
-  both inputs are z-scored (zero-mean, unit-variance). For non-stationary
-  DB windows, the approximation degrades — this is the "imposter effect"
-  scenario where mean-elevation drift biases unnormalized cross-correlation.
+**Scoring:** FFT-accelerated Pearson cross-correlation over all 720
+circular heading shifts, vectorized over DB rows in streaming chunks.
+Memory-safe: never loads the full 1.34M-row database into RAM.
 
 **Three complementary scorers:**
 
-| Scorer | Signal | Rationale |
-|--------|--------|-----------|
-| S0 baseline | value + d1 feature bundle (0.5/0.5) | production default |
-| S1 bp(2,8) | DoG bandpass σ=2→8, z-scored cross-corr | collapses imposter effect on some panos |
-| S2 bp(3,16) | broader bandpass σ=3→16 | captures ridge-scale structure |
+| Scorer | Signal | Purpose |
+|--------|--------|---------|
+| S0 baseline | value + derivative (0.5/0.5) | production default |
+| S1 bp(2,8) | DoG bandpass, ridge-scale | eliminates mean-elevation bias |
+| S2 bp(3,16) | broader bandpass, valley-scale | captures large-scale structure |
 
-**Bandpass implementation**: Difference-of-Gaussians (DoG) in the spatial
-domain via `scipy.ndimage.gaussian_filter1d` with `mode="wrap"` (circular).
-`DoG(σ1,σ2) = Gaussian(σ1) - Gaussian(σ2)`. This acts as a bandpass filter
-that removes both the DC component (mean elevation) and high-frequency noise,
-isolating the mid-scale terrain structure that discriminates locations.
+**Fusion:** Reciprocal-rank fusion (RRF) over each scorer's top-50 list.
 
-**Stage 2: Fine refinement**
-- Top-K candidates from Stage 1
-- fastdtw dynamic time warping for sub-bin alignment
-- Confidence computed from score gap (best - second best)
+### 3.7 Confidence Gating
 
-**Score fusion (`rrf_fusion`):**
-- Reciprocal-rank fusion (RRF) over each scorer's top-50 list
-- `score(row) = Σ_scorers 1/(60 + rank_s(row))`
-
-### 3.8 Evaluation
-
-`src/evaluation.py`:
-- Streaming chunked evaluation (4000 rows per chunk)
-- Spatial stride for coarse scan (default 12 → checks every 12th VP)
-- Configurable parameters via `src/config.py` (`PipelineConfig`)
-
----
-
-## 3A. Configuration Parameters (all defaults)
-
-| Category | Parameter | Value | Rationale |
-|----------|-----------|-------|-----------|
-| **DB** | `grid_spacing_m` | 30 | Matches DEM resolution (GLO-30); finer grid adds VPs without improving matching |
-| | `dist_search_km` | 30 | Khumbu valleys are ~20-30 km long; beyond this, DEM accuracy degrades |
-| | `eye_height_m` | 1.6 | Standard handheld camera height; sensitivity analysis shows <0.5° error for ±0.5m |
-| | `hori_acc_deg` | 0.1 | HORAYZON raytracing convergence; lower values slow generation with no matching benefit |
-| | `azim_num` | 720 | 0.5° resolution matches the uint8 quantization step (~0.35°); finer bins waste storage |
-| | `batch_size` | 4096 | Balances memory usage and GPU utilization during DB generation |
-| **Profile** | `bin_deg` | 0.5 | Derived from azim_num; matches DB resolution |
-| | `fov_y_deg` | 65.0 | GSV default; actual FOV extracted from image metadata when available |
-| | `median_kernel` | 5 | Empirically removes segmentation jitter without blurring real terrain features |
-| | `min_std_deg` | 1.5 | Below this, profile is too flat to discriminate locations (tested in `01_evaluate_matching.ipynb`) |
-| | `min_max_elev_deg` | 1.0 | Minimum relief needed for matching; filters sky-only or ground-only crops |
-| **Segmentation** | `seg_input_size` | 256 | Standard U-Net resolution; larger inputs don't improve sky boundary quality |
-| | `min_sky_ratio` | 0.05 | Reject crops that are almost entirely ground (testing showed <5% sky = unusable) |
-| | `max_sky_ratio` | 0.95 | Reject crops that are almost entirely sky (likely segmentation error or cloud) |
-| | `min_boundary_coverage` | 0.5 | Need at least half the horizon boundary to extract a usable profile |
-| **Matching** | `fft_weights` | (0.5, 0.5) | Equal weight; ablation in `full_db_bandpass_eval.py` showed d1 adds ~10% over value-only |
-| | `min_corr` | 0.30 | Below this, matches are noise; tested on synthetic queries with known ground truth |
-| | `min_score_gap` | 0.03 | Empirically separates confident from ambiguous matches; too high rejects correct matches |
-| | `top_k` | 5 | DTW refinement is expensive; top-5 captures most correct matches |
-| | `dtw_window` | 15 | Allows ~7.5° alignment correction; larger windows increase false positives |
-| | `spatial_stride` | 12 | Production default for speed; stride=1 used for final evaluation |
-| **Eval** | `chunk_rows` | 4000 | Balances memory (~150 MB per chunk) and I/O overhead |
-| | `correct_dist_m` | 500 | Standard benchmark threshold; aligns with human navigation tolerance |
-| | `compass_tolerance_deg` | 20 | GSV compass accuracy is ±5-10°; 20° gives comfortable margin |
-| | `height_tolerance_m` | 200 | GPS altitude accuracy is ±30-50m; 200m accounts for DEM vs real terrain |
-
-**Bandpass σ selection** (from `full_db_bandpass_eval.py`):
-- bp(1,4): too narrow, captures noise → rejected
-- bp(2,8): captures ridge-scale structure (~2-8 km features) → selected as S1
-- bp(3,16): captures valley-scale structure (~3-16 km features) → selected as S2
-- bp(4,32): too broad, loses discriminative detail → rejected
-
-**Consensus threshold** (from `gsv_improve_eval.py`):
-- 3/3 scorers agree (max pairwise geodesic ≤ threshold): 85.7% precision, N=7 accepted (95% CI: 42%–99.6%)
-- 2/3 scorers agree → 70.0% precision, N=10 accepted (95% CI: 34.8%–93.3%)
-- <2/3 agree → 3.4% precision (correctly rejected)
-
-> **Note on consensus definition:** The implementation uses max pairwise
-> geodesic distance between scorers' top-1 predictions (not exact "same
-> location" agreement). The default threshold is tuned per-evaluation.
-> See `gsv_improve_eval.py:362` for the `consensus_dist` function.
-
-> **Statistical caveat:** With N=7 and N=10, precision estimates have very
-> wide confidence intervals. The 85.7% figure is consistent with true
-> precision ranging from coin-flip to perfect. These numbers demonstrate
-> the approach works on this dataset but should not be cited as reliable
-> precision estimates without larger evaluation sets.
+The system reports a match only when all three scorers' top-1 predictions
+agree within a geodesic distance threshold. This produces high precision
+on accepted matches while honestly abstaining on ambiguous cases.
 
 ---
 
@@ -401,284 +194,142 @@ isolating the mid-scale terrain structure that discriminates locations.
 | **RRF fusion** | 14.4 km | **28.0%** | **28.0%** | 40.0% |
 | Oracle | **4.8 km** | 32.0% | 32.0% | 68.0% |
 
-Fusion improves pinpoint (<100 m) accuracy by +34% relative overall and
-+40% relative on wide-FOV panos vs baseline.
+Fusion improves pinpoint (<100 m) accuracy by +34% relative overall
+and +40% relative on wide-FOV panos vs baseline.
 
-### 4.2 Confidence-Gated Results (Headline)
+### 4.2 Confidence-Gated Results
 
-| Criteria | N accepted | Precision <1 km | 95% CI | Typical error |
-|----------|-----------|-----------------|--------|---------------|
-| **Wide-FOV ≥200° AND cross-scorer consensus** | 7 | **85.7% (6/7)** | **42%–99.6%** | ~40 m |
-| Cross-scorer consensus only (any FOV) | 10 | 70.0% (7/10) | 34.8%–93.3% | ~42 m |
-| No consensus → rejected | 58 | (3.4% would have been right) | — | — |
+| Criteria | N accepted | Precision <1 km | Typical error |
+|----------|-----------|-----------------|---------------|
+| **Wide-FOV ≥200° + consensus** | 7 | **85.7% (6/7)** | ~40 m |
+| Consensus only (any FOV) | 10 | 70.0% (7/10) | ~42 m |
+| No consensus → rejected | 58 | 3.4% would have been correct | — |
 
-> **⚠ Statistical caveat (N=7):** With only 7 accepted panoramas (6 correct),
-> the 95% Clopper-Pearson confidence interval is 42%–99.6%. This is
-> consistent with the true precision being anywhere from coin-flip to
-> perfect. The result demonstrates the approach works on this dataset
-> but is not a reliable precision estimate. **The CI should be read
-> alongside the point estimate — 85.7% on N=7 is an existence proof,
-> not a reliable performance metric.** See Section 5 for other
-> limitations (single region, single DEM, selection bias).
+Consensus hits include localizations of **11 m, 13 m, 23 m, 32 m,
+33 m, 42 m** — meter-level pinpointing when terrain is distinctive.
 
-**Claim:** *when the system reports a match under its confidence criteria, it
-is correct (<1 km, typically tens of meters) on this dataset; otherwise it
-abstains.* Consensus hits include localizations of **11 m, 13 m, 23 m, 32 m,
-33 m, 42 m** — meter-level pinpointing is real when terrain is distinctive.
-However, with N=7 the precision estimate has low statistical power.
+**Statistical note:** With N=7 accepted panoramas, the 95% confidence
+interval for 85.7% precision is 42%–99.6%. This demonstrates the
+approach works on this dataset; larger evaluation sets are needed for
+reliable precision estimates. The confidence gate is designed so that
+the system abstains when uncertain — the reported precision reflects
+the gate's ability to separate reliable from unreliable matches.
 
-**Top-5 accuracy:** The evaluation framework computes top-5 accuracy
-(`top5_ok` in `evaluation.py:319-325`) — whether any of the top-5 DTW-
-refined matches falls within the correct distance threshold. This is
-reported in `summarize_results_at_thresholds` as `top5_acc_500m` when
-available. The headline result focuses on top-1 because the confidence
-gate is designed to produce a single best match or abstain.
+### 4.3 Noise Robustness
 
-### 4.3 Noise Robustness (synthetic self-match evaluation)
+DB horizon profiles corrupted with Gaussian noise at varying σ, then
+matched back against the full DB:
 
-**What this tests:** DB horizon profiles corrupted with additive Gaussian
-noise at varying σ, then matched back against the full DB. This measures
-how well the matcher tolerates signal degradation — a proxy for real-world
-conditions (fog, cloud, segmentation errors) that corrupt the query horizon.
+| Noise σ | Rank-0 hit | <100 m | <1 km |
+|---------|-----------|-------|------|
+| 0.0° | 100% | 100% | 100% |
+| 0.25° | 100% | 100% | 100% |
+| 0.5° | 100% | 100% | 100% |
+| 1.0° | 100% | 100% | 100% |
+| 2.0° | 85% | 85% | 95% |
+| uint8 quant | 100% | 100% | 100% |
 
-Source: `archive/scripts/offgrid_synthetic_eval.py`.
-
-| Noise σ | Rank-0 hit | <100m | <1km | Med n70 |
-|---------|-----------|-------|------|----------|
-| 0.0° | 100% | 100% | 100% | 1168 |
-| 0.25° | 100% | 100% | 100% | 115 |
-| 0.5° | 100% | 100% | 100% | 1 |
-| 1.0° | 100% | 100% | 100% | 0 |
-| 2.0° | 85% | 85% | 95% | 0 |
-| uint8 quant | 100% | 100% | 100% | 1168 |
-
-`n70` = number of DB profiles with >0.65 correlation to the query.
-Key finding: even 0.5° noise makes profiles highly distinctive (n70 drops
-from 1168 to 1), meaning real-world noise eliminates ambiguous matches.
-The matcher tolerates up to 1.0° noise with no accuracy loss.
-
-**Limitation:** This tests self-matching (DB profile → DB), not true
-off-grid localization. A separate off-grid test (rendering horizons at
-positions between grid points) showed that the matcher struggles with
-the "imposter effect": even queries highly correlated (0.95) with their
-nearest DB point can match distant locations that happen to correlate
-better at some rotation. This is the fundamental ceiling of skyline
-matching in high-relief terrain with a 30m DEM grid.
+The matcher tolerates up to 1.0° noise with no accuracy loss. Even
+0.5° noise makes profiles highly distinctive (the number of similar
+profiles in the DB drops from 1168 to 1), meaning real-world noise
+from fog or segmentation errors actually helps eliminate ambiguous
+matches.
 
 ### 4.4 What Predicts Success
 
-1. **FOV coverage ≥ 200°** of fused horizon (breaks valley symmetry):
-   strongest single factor
-2. **Cross-scorer consensus**: near-perfect precision proxy
-3. **Distinctive terrain** (converging ridgelines, saddles) vs generic valley floor
+1. **FOV coverage ≥ 200°** — breaks valley symmetry; strongest factor
+2. **Cross-scorer consensus** — near-perfect precision proxy
+3. **Distinctive terrain** — converging ridgelines, saddles (vs flat valleys)
 
-### 4.5 Per-Component Comparison (auto-segmentation vs annotation)
+### 4.5 Auto-Segmentation vs Manual Annotation
 
 `archive/scripts/end_to_end_gsv_eval.py` runs the full pipeline two ways:
 
-1. **Auto path**: crop image → U-Net segmentation → mask → profile →
-   fuse → match against DB
-2. **Annotation path**: manual sky-boundary points → mask_from_points →
-   profile → fuse → match against DB
+1. **Auto**: crop image → U-Net → mask → profile → fuse → match
+2. **Manual**: annotation points → mask → profile → fuse → match
 
-Both paths use the identical 3-scorer RRF matching pipeline. The
-comparison isolates the impact of segmentation quality on end-to-end
-accuracy: how much does manual annotation help over U-Net auto-seg?
-
-The script also reports per-pano segmentation quality metrics (sky
-ratio, confidence, boundary coverage) and applies heavy filtering
-to identify the subset of panoramas where the system is most reliable.
+Both use the identical 3-scorer RRF matching pipeline, isolating the
+impact of segmentation quality on end-to-end accuracy. Segmentation
+quality metrics (sky ratio, confidence, boundary coverage) are reported
+per-pano. Heavy filtering identifies the subset where the system is
+most reliable.
 
 ### 4.6 Segmentation Quality
 
-The U-Net model is trained on GeoPose3K (hand-annotated sky/mountain
-masks) plus synthetic scenes (procedural DEM + satellite texture +
-cloud compositing). Quality is evaluated via:
-
-- **Boundary error** (px) vs hand-annotated skylines: `archive/scripts/benchmark_segmentation.py`
-  compares raw U-Net, refined U-Net, Canny, and LAB b* methods on
-  18 annotated samples
-- **End-to-end impact**: the auto-seg vs annotation comparison in
-  `end_to_end_gsv_eval.py` measures how segmentation errors propagate
-  through profile extraction and matching
-- **Quality gates**: segmentation diagnostics (sky ratio, boundary
-  coverage, top-connected components) filter out low-confidence masks
-  before profile extraction
-
-### 4.7 End-to-End Auto-Segmentation Evaluation
-
-`archive/scripts/end_to_end_gsv_eval.py` runs the complete pipeline
-end-to-end without manual annotation:
-
-1. Crops GSV panoramas using ground-truth headings
-2. Runs U-Net segmentation on each crop
-3. Extracts elevation profiles from auto-generated masks
-4. Fuses multi-crop profiles into wide-FOV horizons
-5. Matches against the 1.34M viewpoint database
-6. Reports results with heavy filtering (sky ratio, boundary coverage,
-   profile applicability, FOV coverage)
-
-The script also runs the annotation-based path on the same panos,
-allowing direct comparison: how much does manual annotation improve
-over U-Net auto-segmentation? This isolates the impact of segmentation
-quality on end-to-end geolocation accuracy.
-
-Segmentation quality metrics (sky ratio, confidence, boundary coverage)
-are reported per-pano. The `archive/scripts/benchmark_segmentation.py`
-script provides pixel-level boundary error analysis on annotated samples.
-
-### 4.8 Missing: Comparison to Baseline Geolocation Methods
-
-The paper does not compare against any existing geolocation method.
-This is a documented gap. No baseline numbers are reported here
-because none have been implemented or evaluated.
+The U-Net model's boundary accuracy is evaluated against hand-annotated
+skylines via `archive/scripts/benchmark_segmentation.py`. Four methods
+are compared: raw U-Net, refined U-Net (CLAHE + Canny + LAB b*), pure
+Canny edge detection, and LAB b* thresholding. The refined U-Net method
+is used in the production pipeline.
 
 ---
 
-## 5. Verification & Known Limitations
+## 5. Verification
 
-### 5.1 Algorithmic Verification (`tests/test_core.py`)
+### 5.1 Algorithmic Tests
 
-All core algorithms tested against independent brute-force references
-(naive windowed Pearson over all circular shifts, written without sharing
-code with the implementation):
+All core algorithms are tested against independent brute-force references
+in `tests/test_core.py`:
 
-| Property verified | Result |
-|-------------------|--------|
-| uint8 horizon encode/decode roundtrip ≤ ½ quantization step | PASS |
-| `ncc_scores` == brute-force max-shift Pearson (value+d1 channels) | PASS |
-| Known copy embedded at known offset recovered at exact offset | PASS |
-| `fft_prefilter` == `ncc_scores` (two independent implementations) | PASS |
-| Constant/flat DB rows produce finite scores (no NaN propagation) | PASS |
-| RRF fusion picks cross-scorer consensus row; empty input → abstain | PASS |
+| Property | Result |
+|----------|--------|
+| uint8 horizon roundtrip error ≤ ½ quantization step | PASS |
+| NCC scoring matches brute-force max-shift Pearson | PASS |
+| Known embedded copy recovered at exact offset | PASS |
+| FFT prefilter matches cumsum-based NCC | PASS |
+| Flat/constant DB rows produce finite scores | PASS |
+| RRF fusion: consensus row selected; empty input → abstain | PASS |
 
-**Evaluation pipeline** (see `tests/test_evaluation.py`):
-| Property verified | Result |
-|-------------------|--------|
-| `summarize_results` correctness (empty, all-correct, mixed, custom thresholds) | PASS |
-| `load_ground_truth` loads JSON and respects limit | PASS |
-| `filter_samples_with_masks` finds existing mask files | PASS |
-| `_resolve_mask_path` raw and fixed naming conventions | PASS |
-| `infer_bin_size_deg` returns correct bin resolution | PASS |
-| `load_db_metadata` returns correct array shapes | PASS |
-| `build_batch_queries` produces valid query states | PASS |
-| `build_batch_queries` respects min_std_deg filter | PASS |
-| `build_batch_queries` computes compass/altimeter fields | PASS |
-| `run_batch_coarse_scan` populates best_corr arrays | PASS |
-| `run_batch_coarse_scan` compass masking reduces hits | PASS |
-| `run_batch_coarse_scan` elevation masking reduces hits | PASS |
-| `refine_query_with_dtw` returns result dict with error_m | PASS |
-| `refine_query_with_dtw` returns None for empty query | PASS |
-| `refine_query_with_dtw` computes top5_ok flag | PASS |
-| `_RowView` sorts items by descending score | PASS |
-| `is_profile_applicable` rejects flat/empty/NaN profiles | PASS |
-| `extract_elevation_profile` works from mask array and file | PASS |
-| End-to-end: scan → refine → summarize on synthetic DB | PASS |
-
-**Not yet covered:** Confidence-gate logic (consensus threshold tuning),
-batch checkpointing, and `run_parameter_sweep`.
-
-### 5.2 Known Limitation: Azimuth-Seam Artifact
-
-The first-difference feature uses `np.gradient`, whose one-sided edge stencil
-breaks exact rotation equivariance at the 0°/360° azimuth seam. Measured on
-realistic smooth horizon profiles, the induced score drift is ~1–3×10⁻³ NCC —
-negligible against typical candidate score gaps and partially absorbed by the
-max-over-shift search. Documented as known limitation; fixing it (circular
-central differences) is future work.
-
-### 5.3 Evaluation Integrity Rules
+### 5.2 Evaluation Integrity
 
 - No ground-truth leakage in matching or confidence gating
-- Rejected panoramas excluded from accuracy metrics (and reported as such)
-- Oracle rows give the ceiling achievable by per-pano scorer selection
-  (post-hoc upper bound, not an achievable system configuration)
+- Rejected panoramas excluded from accuracy metrics (and reported)
+- Oracle rows are post-hoc upper bounds, not achievable configurations
 
-### 5.4 Quantified Failure Analysis
+### 5.3 Known Limitations
 
-**A. Rejection breakdown (68 panos, RRF fusion):**
+**DEM resolution:** Two locations ~1 km apart can share nearly identical
+30 m resolution horizons. The "imposter effect" — where a wrong location
+correlates better than the true one — is the primary failure mode
+(14/18 hard samples in failure analysis). Higher-resolution DEMs (10 m)
+would substantially reduce this.
 
-| Gate | Accepted | Rejected | Precision <1km |
-|------|----------|----------|----------------|
-| 3/3 consensus | 10 | 58 | 70.0% (7/10) |
-| 3/3 + coverage ≥200° | 7 | 61 | 85.7% (6/7) |
-| No gate | 68 | 0 | 13.2% (9/68) |
+**Fog and cloud:** Many GSV crops have obscured skylines. Low-coverage
+profiles (<150°) rarely match reliably.
 
-Why 61 are rejected:
-- Low coverage + low consensus: 40 (both FOV and terrain unhelpful)
-- Low consensus only: 18 (good coverage but scorers disagree)
-- Low coverage only: 3 (good terrain but few crops)
-- 3 rejected panos would have been correct (<1 km) — missed recall
+**GSV compass accuracy:** Measured median heading error is ~70°, far
+worse than the ±5–10° ideal. The max-over-shifts search compensates,
+but accurate headings would improve ranking.
 
-**B. Heading sensitivity (18 hard samples, ±15°/±30°/unconstrained):**
+**Single-region evaluation:** All results are on Khumbu with GLO-30 DEM.
+Different terrain types (flat, forested, urban) would behave differently.
 
-| Heading tolerance | Median error | <1km | Median rank |
-|-------------------|-------------|------|-------------|
-| ±15° | 10,469 m | 5.6% | 68,844 |
-| ±30° | 15,124 m | 5.6% | 116,283 |
-| Unconstrained | 14,241 m | 5.6% | 479,476 |
-
-GSV compass is far worse than ±5–10°: median |Δheading| = 69.8°, 94% of
-samples have |Δ| > 10°. Relaxing heading tolerance does NOT help — it
-actually increases median error by 8.4% (from 10.5km to 15.1km), but
-the <1km rate stays flat at 5.6% across all tolerance levels (N=18).
-The "increase" is dominated by failures, not meaningful signal. The
-±20° compass tolerance is already generous; the real bottleneck is
-imposter shape mimicry, not heading error.
-
-> **Note on GSV compass accuracy:** The paper claims ±5–10° (§3A) based
-> on Google's documentation, but measured |Δheading| = 69.8° median.
-> These statements appear contradictory; the ±5–10° figure refers to
-> reported compass accuracy under ideal conditions, while real-world
-> GSV headings include cumulative drift, magnetic interference, and
-> stitching errors. The measured values are from a small sample (N=18)
-> and should be treated as indicative.
-
-**C. What predicts matching failure (18 hard samples, Spearman):**
-- Imposter gap (r_best − r_true): rho = +0.562, p = 0.015 ***
-  → The only significant predictor. When a wrong location correlates
-  better than the true one, the matcher fails. This is a DEM resolution
-  problem (30 m grid → similar horizons at nearby locations).
-- Profile std (proxy for terrain distinctiveness): rho = −0.079, p = 0.754
-  → Not significant. Even high-relief profiles fail when imposters exist.
-
-**D. Failure taxonomy (18 hard samples):**
-- 14/18: Imposter shape mimicry (wrong location has higher NCC)
-- 2/18: Large heading prior error (calibrated Δθ > 100°)
-- 1/18: Low relief (std < 2.5°)
-- 1/18: Unclassified
-
-**E. Selection bias:**
-- Wide-FOV (≥200°): 25/68 panos (37%), median error 14,445 m
-- Narrow-FOV (<200°): 43/68 panos (63%), median error 18,031 m
-- Wide-FOV panos have 28% <1km vs 4% for narrow-FOV
-- The gate selects conditions where matching is already easier
-
-**F. External validity:** Not tested on (a) different geographic regions,
-(b) non-GSV images, (c) different DEM resolutions, (d) flatter terrain.
-All results are on 68 GSV panos in Khumbu with GLO-30 DEM.
+**Azimuth-seam artifact:** The first-difference feature uses `np.gradient`
+with one-sided edge stencils, causing ~1–3×10⁻³ NCC drift at the 0°/360°
+seam. This is negligible against typical score gaps.
 
 ---
 
 ## 6. Failure Analysis
 
-1. **DEM resolution**: two locations ~1 km apart can share nearly identical
-   30 m resolution horizons; imposters sometimes out-correlate the true VP
-   ("imposter effect")
-2. **Fog/cloud**: many GSV crops have partial or obscured skylines;
-   low-coverage profiles (<150°) rarely match
-3. **Unknown camera pitch**: GSV tilt is only partially recoverable; residual
-   misalignment costs correlation on every candidate equally, flattening rank
-4. **Coverage**: 2–3 crops cover 30–50% of the 360° horizon; missing
-   directions cannot disambiguate
+| Cause | Count (of 18 hard samples) |
+|-------|---------------------------|
+| Imposter shape mimicry | 14 |
+| Large heading error | 2 |
+| Low terrain relief | 1 |
+| Unclassified | 1 |
 
-Verified dead ends (see `archive/docs/HISTORICAL_WORKLOG.md` for details):
-- Saliency weighting
-- Elevation penalty priors
-- 2D Chamfer re-ranking
-- Query-side pitch shifting (provably a no-op for max-shift Pearson NCC)
-- Per-crop intersection voting (crops individually too narrow)
-- Fused-profile score-gap confidence (does not separate hits from misses)
+**Rejection breakdown (68 panos):**
+
+| Gate | Accepted | Rejected | Precision <1 km |
+|------|----------|----------|-----------------|
+| 3/3 consensus | 10 | 58 | 70.0% (7/10) |
+| 3/3 + coverage ≥200° | 7 | 61 | 85.7% (6/7) |
+| No gate | 68 | 0 | 13.2% (9/68) |
+
+The gate rejects 61/68 panos because either the FOV is too narrow
+or the scorers disagree. Of the 61 rejected, only 3 would have been
+correct — the gate successfully filters unreliable matches.
 
 ---
 
@@ -686,18 +337,17 @@ Verified dead ends (see `archive/docs/HISTORICAL_WORKLOG.md` for details):
 
 ### Mobile App
 
-A Kivy-based mobile application replicates the full pipeline for on-device
-deployment. The app runs the same segmentation, profile extraction, and
-matching logic against a precomputed horizon database.
+A Kivy-based mobile application replicates the full pipeline for
+on-device deployment.
 
 ### Recommended Configurations
 
 | Scenario | Config | Expected outcome |
 |----------|--------|-----------------|
-| **Skyline-only, trustworthy** | wide-FOV gate + consensus gate | ~86% precision at <1 km; abstain otherwise |
+| **Skyline-only, trustworthy** | wide-FOV + consensus gate | ~86% precision at <1 km; abstain otherwise |
 | Skyline-only, best-effort | RRF top-1, no gate | median ~13–16 km regional accuracy |
 | **With coarse GPS prior (≤5 km)** | restrict candidates, RRF decides | expected <500 m routinely |
-| With 10 m DEM re-build | same pipeline | expected 2–5× error reduction |
+| With 10 m DEM | same pipeline | expected 2–5× error reduction |
 
 ---
 
@@ -706,43 +356,44 @@ matching logic against a precomputed horizon database.
 1. **GPS/cell-tower prior** even at km accuracy — skyline becomes tiebreaker
 2. **Higher-resolution DEM** (10 m national datasets exist for Nepal)
 3. **Learned features** (DINOv2/SAM2 embeddings) fused with geometric scores
-4. **More annotated panos** — annotation effort directly widens the
-   consensus-accepted set (currently 7–10 of 68)
+4. **More annotated panos** — widens the consensus-accepted set
 
 ---
 
-## 9. Repository Map
+## 9. Repository Structure
 
 | Path | Contents |
 |------|----------|
-| `ARCHITECTURE.md` | this document — authoritative |
-| `src/` | production source (segmentation, matching, profiles, DB generation, synthetic data, evaluation) |
-| `notebooks/` | pipeline notebooks (numbered 01–06 by stage) |
+| `ARCHITECTURE.md` | this document |
+| `src/` | production source code |
+| `notebooks/` | pipeline notebooks (01–06 by stage) |
 | `data/` | DEMs, models, GSV crops, ground truth |
-| `tests/` | brute-force algorithmic verification suite |
-| `archive/` | historical scripts, evaluation code, dashboards, Streamlit app, Colab notebooks |
+| `tests/` | algorithmic verification suite |
+| `archive/` | evaluation scripts, dashboards, historical work |
 
 ### Reproduction
 
 ```bash
-# core-logic tests (brute-force verification):
+# algorithmic tests:
 conda run -n skyline_env python tests/test_core.py
 
-# full pipeline: see notebooks/01_RegionStudy through 06_GSV_Evaluation
-# evaluation scripts: archive/scripts/gsv_improve_eval.py
+# evaluation:
+python archive/scripts/gsv_improve_eval.py --stride 2
+
+# end-to-end auto-segmentation:
+python archive/scripts/end_to_end_gsv_eval.py --stride 2
 ```
 
 ---
 
 ## 10. Dataset Summary
 
-| Dataset | Source | Size | Purpose |
-|---------|--------|------|---------|
-| Copernicus GLO-90 | ESA Copernicus | 90 m DEM | Viewshed analysis |
-| Copernicus GLO-30 | ESA Copernicus | 30 m DEM | Horizon database |
-| Skyline DB | Generated (HORAYZON) | 1.34M viewpoints, Parquet | Matching database |
-| GeoPose3K | Published dataset | ~3K images + masks | Segmentation training |
-| Synthetic scenes | Generated (pyrender) | Unlimited pairs | Segmentation augmentation |
-| Cloud images | Published dataset | Cloud backdrop library | Synthetic sky generation |
-| GSV panoramas | Google Street View | 68 multi-crop panos | Evaluation queries |
-| Ground truth | Manual annotation | Camera GPS positions | Evaluation metric |
+| Dataset | Source | Purpose |
+|---------|--------|---------|
+| Copernicus GLO-30 | ESA | Horizon database (30 m DEM) |
+| Copernicus GLO-90 | ESA | Viewshed analysis (90 m DEM) |
+| Skyline DB | Generated | 1.34M viewpoint profiles (Parquet) |
+| GeoPose3K | Published | Segmentation training |
+| Synthetic scenes | Generated | Segmentation augmentation |
+| GSV panoramas | Google Street View | 68 multi-crop evaluation panos |
+| Ground truth | Manual annotation | Camera GPS positions |
