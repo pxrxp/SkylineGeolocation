@@ -789,33 +789,7 @@ function sendAction(endpoint, body) {
   }).then(r => r.json()).then(apply);
 }
 
-svg.addEventListener('pointerdown', evt => {
-  svg.setPointerCapture(evt.pointerId);
-  dragging = true;
-  strokePts = [pos(evt)];
-  render();
-});
-
-svg.addEventListener('pointermove', evt => {
-  if (dragging) {
-    strokePts.push(pos(evt));
-    render();
-  }
-});
-
-svg.addEventListener('pointerup', (evt) => {
-  if (dragging) {
-    dragging = false;
-    const radius = parseInt(document.getElementById('brush_size').value);
-    if (tool === 'sky_point' || tool === 'terrain_point') {
-      const clickPt = pos(evt);
-      sendAction('scribble_brush', {points: [clickPt], tool: tool, radius: radius});
-    } else if (strokePts.length > 1) {
-      sendAction('scribble_brush', {points: strokePts, tool: 'scribble', radius: radius});
-    }
-    strokePts = [];
-  }
-});
+// (duplicate handlers removed — first set at line 741 handles all tools)
 
 window.addEventListener('keydown', evt => {
   if (evt.key === 's') sendAction('annotate', {});
