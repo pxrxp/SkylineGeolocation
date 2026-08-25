@@ -489,38 +489,59 @@ central differences) is future work.
 - Oracle rows give the ceiling achievable by per-pano scorer selection
   (post-hoc upper bound, not an achievable system configuration)
 
-### 5.4 Methodological Limitations
+### 5.4 Quantified Failure Analysis
 
-1. **Small sample size (N=7 accepted):** The headline 85.7% precision has
-   a 95% Clopper-Pearson CI of 42%–99.6%. This is not a reliable precision
-   estimate — it demonstrates feasibility, not production readiness.
+**A. Rejection breakdown (68 panos, RRF fusion):**
 
-2. **No external validity:** All evaluation is on 68 GSV panoramas in the
-   Khumbu region, using GLO-30 DEM and HORAYZON for both DB and queries.
-   Not tested on: (a) different geographic regions, (b) non-GSV images,
-   (c) different DEM resolutions, (d) flatter terrain with less distinctive
-   skylines. The 85.7% number may not generalize.
+| Gate | Accepted | Rejected | Precision <1km |
+|------|----------|----------|----------------|
+| 3/3 consensus | 10 | 58 | 70.0% (7/10) |
+| 3/3 + coverage ≥200° | 7 | 61 | 85.7% (6/7) |
+| No gate | 68 | 0 | 13.2% (9/68) |
 
-3. **Selection bias:** The wide-FOV ≥200° gate selects panoramas with good
-   coverage, which correlates with open terrain and clear sightlines —
-   precisely the conditions where matching should be easiest. This inflates
-   gated precision relative to what would be achieved on unselected inputs.
+Why 61 are rejected:
+- Low coverage + low consensus: 40 (both FOV and terrain unhelpful)
+- Low consensus only: 18 (good coverage but scorers disagree)
+- Low coverage only: 3 (good terrain but few crops)
+- 3 rejected panos would have been correct (<1 km) — missed recall
 
-4. **Consensus gating rejects 85% of queries:** 58 out of 68 panoramas are
-   rejected (85.3%). A system that can only localize 10–15% of inputs has
-   limited practical utility without complementary methods (GPS prior, etc.).
+**B. Heading sensitivity (18 hard samples, ±15°/±30°/unconstrained):**
 
-5. **No error decomposition:** It is unknown how much error comes from DEM
-   resolution (30m) vs. segmentation inaccuracy vs. matching limitations.
-   A factor analysis would strengthen the methodology.
+| Heading tolerance | Median error | <1km | Median rank |
+|-------------------|-------------|------|-------------|
+| ±15° | 10,469 m | 5.6% | 68,844 |
+| ±30° | 15,124 m | 5.6% | 116,283 |
+| Unconstrained | 14,241 m | 5.6% | 479,476 |
 
-6. **Heading sensitivity untested:** GSV compass metadata has systematic
-   bias (±5–10°). The 20° compass tolerance partially absorbs this, but
-   sensitivity to heading error is not quantified.
+GSV compass is far worse than ±5–10°: median |Δheading| = 69.8°, 94% of
+samples have |Δ| > 10°. Relaxing heading tolerance does NOT help — it
+actually increases median error by 8.4%. The ±20° compass tolerance is
+already generous; the real bottleneck is imposter shape mimicry, not
+heading error.
 
-7. **Bandpass σ selection is ad hoc:** σ values were selected by qualitative
-   inspection, not cross-validation or ablation. The 0.5/0.5 feature weights
-   are similarly unoptimized.
+**C. What predicts matching failure (18 hard samples, Spearman):**
+- Imposter gap (r_best − r_true): rho = +0.562, p = 0.015 ***
+  → The only significant predictor. When a wrong location correlates
+  better than the true one, the matcher fails. This is a DEM resolution
+  problem (30 m grid → similar horizons at nearby locations).
+- Profile std (proxy for terrain distinctiveness): rho = −0.079, p = 0.754
+  → Not significant. Even high-relief profiles fail when imposters exist.
+
+**D. Failure taxonomy (18 hard samples):**
+- 14/18: Imposter shape mimicry (wrong location has higher NCC)
+- 2/18: Large heading prior error (calibrated Δθ > 100°)
+- 1/18: Low relief (std < 2.5°)
+- 1/18: Unclassified
+
+**E. Selection bias:**
+- Wide-FOV (≥200°): 25/68 panos (37%), median error 14,445 m
+- Narrow-FOV (<200°): 43/68 panos (63%), median error 18,031 m
+- Wide-FOV panos have 28% <1km vs 4% for narrow-FOV
+- The gate selects conditions where matching is already easier
+
+**F. External validity:** Not tested on (a) different geographic regions,
+(b) non-GSV images, (c) different DEM resolutions, (d) flatter terrain.
+All results are on 68 GSV panos in Khumbu with GLO-30 DEM.
 
 ---
 
