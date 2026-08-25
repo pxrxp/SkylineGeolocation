@@ -17,6 +17,7 @@ from src.matching import (
     ncc_scores,
 )
 from src.horizon_format import decode_horizon_uint8, decode_horizon_column
+from src.query_profile import extract_elevation_profile, is_profile_applicable
 
 
 def _stream_horizon_chunks(parquet_path, chunk_rows=4000):
@@ -503,9 +504,6 @@ def run_evaluation(
     return df, summary
 
 
-# Simple helper import needed by the evaluator
-# Simple helper import needed by the evaluator
-from src.query_profile import extract_elevation_profile, is_profile_applicable
 
 
 def _merge_topk(

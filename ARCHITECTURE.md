@@ -94,15 +94,16 @@ a 30 m resolution global DEM.
 │       → D1 channel: z-scored first derivative (np.gradient)     │
 │       → Bandpass channels: DoG σ2→8, σ3→16 for multi-scale     │
 │                                                                  │
-│  [11] Pearson NCC scoring:                                       │
-│       → Max-over-circular-shifts Pearson correlation             │
+│  [11] Cross-correlation scoring:                                │
+│       → Max-over-circular-shifts on z-scored features           │
 │       → FFT-accelerated cross-correlation (one FFT per chunk)   │
 │       → Vectorized over all DB rows (batched in 4000-row chunks)│
 │       → Memory-safe streaming: never loads full DB into RAM     │
+│       → Pearson-equivalent when both inputs are z-scored        │
 │                                                                  │
 │  [12] Three complementary scorers:                               │
 │       → S0 baseline: value + d1 feature bundle (0.5/0.5 weight) │
-│       → S1 bp(2,8): DoG bandpass σ=2→8, plain Pearson          │
+│       → S1 bp(2,8): DoG bandpass σ=2→8, z-scored cross-corr    │
 │       → S2 bp(3,16): broader bandpass σ=3→16                   │
 │                                                                  │
 │  [13] Score fusion:                                              │
@@ -118,8 +119,10 @@ a 30 m resolution global DEM.
 │  CONFIDENCE GATING                                               │
 │                                                                  │
 │  [15] Cross-scorer consensus:                                    │
-│       → Match reported ONLY when all three scorers' top-1       │
-│         predictions agree (same location)                        │
+│       → Match reported when all three scorers' top-1            │
+│         predictions land within a geodesic distance threshold   │
+│         of each other (max pairwise distance ≤ D)              │
+│       → Default threshold: 1.0 km (tuned in gsv_improve_eval)  │
 │       → Otherwise: system outputs "cannot localize"              │
 │       → Result: high precision on accepted matches,             │
 │         honest abstention on ambiguous cases                     │
@@ -272,22 +275,27 @@ strength and profile consistency.
 
 `src/matching.py` — two-stage pipeline with shared-FFT multi-query scoring:
 
-**Stage 1: Coarse spatial scan (Pearson NCC)**
+**Stage 1: Coarse spatial scan (z-scored cross-correlation)**
 - Feature extraction: z-scored value + z-scored first derivative
 - Max-over-circular-shifts: tests all 720 heading alignments
 - Two implementations (mathematically equivalent, verified by tests):
-  - **Production** (`ncc_scores`): cumsum-based windowed Pearson for single
-    queries; O(N×L) with low constant factor
+  - **Production** (`ncc_scores`): cumsum-based windowed cross-correlation
+    for single queries; O(N×L) with low constant factor
   - **Evaluation** (`score_chunk_shared_fft`): FFT-based cross-correlation
     shared across multiple queries per chunk; ~16× faster for batch scoring
 - Memory-safe streaming: never loads full 1.34M-row DB into RAM
+- **Terminology:** The code computes z-scored cross-correlation
+  (`irfft(conj(q) * d) / N_BINS`), which is Pearson-equivalent when
+  both inputs are z-scored (zero-mean, unit-variance). For non-stationary
+  DB windows, the approximation degrades — this is the "imposter effect"
+  scenario where mean-elevation drift biases unnormalized cross-correlation.
 
 **Three complementary scorers:**
 
 | Scorer | Signal | Rationale |
 |--------|--------|-----------|
 | S0 baseline | value + d1 feature bundle (0.5/0.5) | production default |
-| S1 bp(2,8) | DoG bandpass σ=2→8, plain Pearson | collapses imposter effect on some panos |
+| S1 bp(2,8) | DoG bandpass σ=2→8, z-scored cross-corr | collapses imposter effect on some panos |
 | S2 bp(3,16) | broader bandpass σ=3→16 | captures ridge-scale structure |
 
 **Bandpass implementation**: Difference-of-Gaussians (DoG) in the spatial
@@ -351,9 +359,14 @@ isolating the mid-scale terrain structure that discriminates locations.
 - bp(4,32): too broad, loses discriminative detail → rejected
 
 **Consensus threshold** (from `gsv_improve_eval.py`):
-- 3/3 scorers agree → 85.7% precision, N=7 accepted (95% CI: 42%–99.6%)
+- 3/3 scorers agree (max pairwise geodesic ≤ threshold): 85.7% precision, N=7 accepted (95% CI: 42%–99.6%)
 - 2/3 scorers agree → 70.0% precision, N=10 accepted (95% CI: 34.8%–93.3%)
 - <2/3 agree → 3.4% precision (correctly rejected)
+
+> **Note on consensus definition:** The implementation uses max pairwise
+> geodesic distance between scorers' top-1 predictions (not exact "same
+> location" agreement). The default threshold is tuned per-evaluation.
+> See `gsv_improve_eval.py:362` for the `consensus_dist` function.
 
 > **Statistical caveat:** With N=7 and N=10, precision estimates have very
 > wide confidence intervals. The 85.7% figure is consistent with true
@@ -395,15 +408,17 @@ Fusion improves pinpoint (<100 m) accuracy by +34% relative overall and
 
 | Criteria | N accepted | Precision <1 km | 95% CI | Typical error |
 |----------|-----------|-----------------|--------|---------------|
-| **Wide-FOV ≥200° AND cross-scorer consensus** | 7 | **85.7%** | 42%–99.6% | ~40 m |
-| Cross-scorer consensus only (any FOV) | 10 | 70.0% | 34.8%–93.3% | ~42 m |
+| **Wide-FOV ≥200° AND cross-scorer consensus** | 7 | **85.7% (6/7)** | **42%–99.6%** | ~40 m |
+| Cross-scorer consensus only (any FOV) | 10 | 70.0% (7/10) | 34.8%–93.3% | ~42 m |
 | No consensus → rejected | 58 | (3.4% would have been right) | — | — |
 
-> **Statistical caveat (N=7):** With only 7 accepted panoramas (6 correct),
+> **⚠ Statistical caveat (N=7):** With only 7 accepted panoramas (6 correct),
 > the 95% Clopper-Pearson confidence interval is 42%–99.6%. This is
 > consistent with the true precision being anywhere from coin-flip to
 > perfect. The result demonstrates the approach works on this dataset
-> but is not a reliable precision estimate. See Section 5 for other
+> but is not a reliable precision estimate. **The CI should be read
+> alongside the point estimate — 85.7% on N=7 is an existence proof,
+> not a reliable performance metric.** See Section 5 for other
 > limitations (single region, single DEM, selection bias).
 
 **Claim:** *when the system reports a match under its confidence criteria, it
@@ -411,6 +426,13 @@ is correct (<1 km, typically tens of meters) on this dataset; otherwise it
 abstains.* Consensus hits include localizations of **11 m, 13 m, 23 m, 32 m,
 33 m, 42 m** — meter-level pinpointing is real when terrain is distinctive.
 However, with N=7 the precision estimate has low statistical power.
+
+**Top-5 accuracy:** The evaluation framework computes top-5 accuracy
+(`top5_ok` in `evaluation.py:319-325`) — whether any of the top-5 DTW-
+refined matches falls within the correct distance threshold. This is
+reported in `summarize_results_at_thresholds` as `top5_acc_500m` when
+available. The headline result focuses on top-1 because the confidence
+gate is designed to produce a single best match or abstain.
 
 ### 4.3 Noise Robustness (off-grid synthetic evaluation)
 
@@ -440,6 +462,12 @@ Source: `archive/scripts/offgrid_synthetic_eval.py`.
 | 2.0° | low | large | ~15m | 0 |
 | uint8 quant | ~1.000 | ~0.000 | ~15m | 1187 |
 
+> **Note on geographic error (~15m):** The ~15m geographic error is an
+> artifact of grid spacing (nearest DB row is always within ~15m of
+> the true off-grid position), not a localization metric. This column
+> shows trivially low values by construction and should not be
+> interpreted as a measure of system accuracy.
+
 `n70` = number of DB profiles correlating > 0.65 with the query.
 Key finding: even 0.5° noise makes profiles highly distinctive (n70 drops
 from 1187 to 1), meaning real-world noise would actually HELP
@@ -453,6 +481,31 @@ localization — see caveat above.
    strongest single factor
 2. **Cross-scorer consensus**: near-perfect precision proxy
 3. **Distinctive terrain** (converging ridgelines, saddles) vs generic valley floor
+
+### 4.5 Missing: Per-Component Ablation
+
+The paper does not isolate the contribution of each pipeline stage
+(segmentation quality → profile extraction → bandpass filtering →
+RRF fusion → confidence gating). Section 4.1 shows per-scorer results,
+but this does not attribute gains to individual components. A proper
+ablation would measure: (a) segmentation IoU impact on end-to-end
+accuracy, (b) profile extraction sensitivity to FOV and resolution,
+(c) bandpass vs baseline contribution, (d) RRF vs individual scorer
+performance, (e) confidence gate precision-recall tradeoff.
+
+### 4.6 Missing: Segmentation Quality Evaluation
+
+The U-Net model's IoU, boundary accuracy, and failure modes on GSV
+images are never quantified. The paper assumes segmentation works but
+does not provide evidence. See `tests/test_core.py` for algorithmic
+verification of the matching pipeline, but segmentation quality is
+not covered.
+
+### 4.7 Missing: Comparison to Baseline Geolocation Methods
+
+The paper does not compare against any existing geolocation method.
+This is a documented gap. No baseline numbers are reported here
+because none have been implemented or evaluated.
 
 ---
 
@@ -472,6 +525,32 @@ code with the implementation):
 | `fft_prefilter` == `ncc_scores` (two independent implementations) | PASS |
 | Constant/flat DB rows produce finite scores (no NaN propagation) | PASS |
 | RRF fusion picks cross-scorer consensus row; empty input → abstain | PASS |
+
+**Evaluation pipeline** (see `tests/test_evaluation.py`):
+| Property verified | Result |
+|-------------------|--------|
+| `summarize_results` correctness (empty, all-correct, mixed, custom thresholds) | PASS |
+| `load_ground_truth` loads JSON and respects limit | PASS |
+| `filter_samples_with_masks` finds existing mask files | PASS |
+| `_resolve_mask_path` raw and fixed naming conventions | PASS |
+| `infer_bin_size_deg` returns correct bin resolution | PASS |
+| `load_db_metadata` returns correct array shapes | PASS |
+| `build_batch_queries` produces valid query states | PASS |
+| `build_batch_queries` respects min_std_deg filter | PASS |
+| `build_batch_queries` computes compass/altimeter fields | PASS |
+| `run_batch_coarse_scan` populates best_corr arrays | PASS |
+| `run_batch_coarse_scan` compass masking reduces hits | PASS |
+| `run_batch_coarse_scan` elevation masking reduces hits | PASS |
+| `refine_query_with_dtw` returns result dict with error_m | PASS |
+| `refine_query_with_dtw` returns None for empty query | PASS |
+| `refine_query_with_dtw` computes top5_ok flag | PASS |
+| `_RowView` sorts items by descending score | PASS |
+| `is_profile_applicable` rejects flat/empty/NaN profiles | PASS |
+| `extract_elevation_profile` works from mask array and file | PASS |
+| End-to-end: scan → refine → summarize on synthetic DB | PASS |
+
+**Not yet covered:** Confidence-gate logic (consensus threshold tuning),
+batch checkpointing, and `run_parameter_sweep`.
 
 ### 5.2 Known Limitation: Azimuth-Seam Artifact
 
@@ -515,9 +594,19 @@ Why 61 are rejected:
 
 GSV compass is far worse than ±5–10°: median |Δheading| = 69.8°, 94% of
 samples have |Δ| > 10°. Relaxing heading tolerance does NOT help — it
-actually increases median error by 8.4%. The ±20° compass tolerance is
-already generous; the real bottleneck is imposter shape mimicry, not
-heading error.
+actually increases median error by 8.4% (from 10.5km to 15.1km), but
+the <1km rate stays flat at 5.6% across all tolerance levels (N=18).
+The "increase" is dominated by failures, not meaningful signal. The
+±20° compass tolerance is already generous; the real bottleneck is
+imposter shape mimicry, not heading error.
+
+> **Note on GSV compass accuracy:** The paper claims ±5–10° (§3A) based
+> on Google's documentation, but measured |Δheading| = 69.8° median.
+> These statements appear contradictory; the ±5–10° figure refers to
+> reported compass accuracy under ideal conditions, while real-world
+> GSV headings include cumulative drift, magnetic interference, and
+> stitching errors. The measured values are from a small sample (N=18)
+> and should be treated as indicative.
 
 **C. What predicts matching failure (18 hard samples, Spearman):**
 - Imposter gap (r_best − r_true): rho = +0.562, p = 0.015 ***

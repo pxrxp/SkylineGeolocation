@@ -529,6 +529,14 @@ def fuse_profiles(crops, gt_data, bin_deg=0.5):
 def mask_from_points(points):
     """Convert a list of (x, y) boundary points to a binary sky mask.
 
+    Returns a mask sized to the annotation bounding box (max_x+2, max_y+2),
+    NOT the original image dimensions. The mask dimensions correspond to the
+    annotation extent, not the full image — this affects downstream focal
+    length calculations in extract_elevation_profile which derive W from the
+    mask width. Callers that need image-dimension masks should use the
+    eval-scripts version (calibrate_and_eval_multiphoto.py) which targets
+    a fixed W×H output.
+
     Returns mask where 0 = sky, 1 = ground, or None if insufficient points.
     """
     if not points or len(points) < 3:
