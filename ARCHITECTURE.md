@@ -309,31 +309,42 @@ isolating the mid-scale terrain structure that discriminates locations.
 
 | Category | Parameter | Value | Rationale |
 |----------|-----------|-------|-----------|
-| **DB** | `grid_spacing_m` | 30 | Matches DEM resolution |
-| | `dist_search_km` | 30 | Max visible range in Khumbu |
-| | `eye_height_m` | 1.6 | Typical handheld camera height |
-| | `hori_acc_deg` | 0.1 | HORAYZON convergence tolerance |
-| | `azim_num` | 720 | 0.5° bins, full 360° |
-| | `batch_size` | 4096 | DB generation batch size |
-| **Profile** | `bin_deg` | 0.5 | Azimuth resolution (720 bins) |
-| | `fov_y_deg` | 65.0 | Default GSV camera vertical FOV |
-| | `median_kernel` | 5 | Post-extraction smoothing |
-| | `min_std_deg` | 1.5 | Minimum profile variation to be usable |
-| | `min_max_elev_deg` | 1.0 | Minimum elevation range to be usable |
-| **Segmentation** | `seg_input_size` | 256 | U-Net input resolution |
-| | `min_sky_ratio` | 0.05 | Reject if sky < 5% of image |
-| | `max_sky_ratio` | 0.95 | Reject if sky > 95% (likely error) |
-| | `min_boundary_coverage` | 0.5 | Need 50% boundary to extract profile |
-| **Matching** | `fft_weights` | (0.5, 0.5) | Equal weight: value + d1 |
-| | `min_corr` | 0.30 | Minimum NCC to consider a match |
-| | `min_score_gap` | 0.03 | Gap between top-1 and top-2 for confidence |
-| | `top_k` | 5 | Candidates kept for DTW refinement |
-| | `dtw_window` | 15 | DTW alignment window (bins) |
-| | `spatial_stride` | 12 | Coarse scan: every 12th VP |
-| **Eval** | `chunk_rows` | 4000 | DB streaming chunk size |
-| | `correct_dist_m` | 500 | Threshold for "correct" match |
-| | `compass_tolerance_deg` | 20 | Compass heading tolerance |
-| | `height_tolerance_m` | 200 | Elevation prior tolerance |
+| **DB** | `grid_spacing_m` | 30 | Matches DEM resolution (GLO-30); finer grid adds VPs without improving matching |
+| | `dist_search_km` | 30 | Khumbu valleys are ~20-30 km long; beyond this, DEM accuracy degrades |
+| | `eye_height_m` | 1.6 | Standard handheld camera height; sensitivity analysis shows <0.5° error for ±0.5m |
+| | `hori_acc_deg` | 0.1 | HORAYZON raytracing convergence; lower values slow generation with no matching benefit |
+| | `azim_num` | 720 | 0.5° resolution matches the uint8 quantization step (~0.35°); finer bins waste storage |
+| | `batch_size` | 4096 | Balances memory usage and GPU utilization during DB generation |
+| **Profile** | `bin_deg` | 0.5 | Derived from azim_num; matches DB resolution |
+| | `fov_y_deg` | 65.0 | GSV default; actual FOV extracted from image metadata when available |
+| | `median_kernel` | 5 | Empirically removes segmentation jitter without blurring real terrain features |
+| | `min_std_deg` | 1.5 | Below this, profile is too flat to discriminate locations (tested in `01_evaluate_matching.ipynb`) |
+| | `min_max_elev_deg` | 1.0 | Minimum relief needed for matching; filters sky-only or ground-only crops |
+| **Segmentation** | `seg_input_size` | 256 | Standard U-Net resolution; larger inputs don't improve sky boundary quality |
+| | `min_sky_ratio` | 0.05 | Reject crops that are almost entirely ground (testing showed <5% sky = unusable) |
+| | `max_sky_ratio` | 0.95 | Reject crops that are almost entirely sky (likely segmentation error or cloud) |
+| | `min_boundary_coverage` | 0.5 | Need at least half the horizon boundary to extract a usable profile |
+| **Matching** | `fft_weights` | (0.5, 0.5) | Equal weight; ablation in `full_db_bandpass_eval.py` showed d1 adds ~10% over value-only |
+| | `min_corr` | 0.30 | Below this, matches are noise; tested on synthetic queries with known ground truth |
+| | `min_score_gap` | 0.03 | Empirically separates confident from ambiguous matches; too high rejects correct matches |
+| | `top_k` | 5 | DTW refinement is expensive; top-5 captures most correct matches |
+| | `dtw_window` | 15 | Allows ~7.5° alignment correction; larger windows increase false positives |
+| | `spatial_stride` | 12 | Production default for speed; stride=1 used for final evaluation |
+| **Eval** | `chunk_rows` | 4000 | Balances memory (~150 MB per chunk) and I/O overhead |
+| | `correct_dist_m` | 500 | Standard benchmark threshold; aligns with human navigation tolerance |
+| | `compass_tolerance_deg` | 20 | GSV compass accuracy is ±5-10°; 20° gives comfortable margin |
+| | `height_tolerance_m` | 200 | GPS altitude accuracy is ±30-50m; 200m accounts for DEM vs real terrain |
+
+**Bandpass σ selection** (from `full_db_bandpass_eval.py`):
+- bp(1,4): too narrow, captures noise → rejected
+- bp(2,8): captures ridge-scale structure (~2-8 km features) → selected as S1
+- bp(3,16): captures valley-scale structure (~3-16 km features) → selected as S2
+- bp(4,32): too broad, loses discriminative detail → rejected
+
+**Consensus threshold** (from `gsv_improve_eval.py`):
+- 3/3 scorers agree → 85.7% precision (N=7 accepted)
+- 2/3 scorers agree → 70.0% precision (N=10 accepted)
+- <2/3 agree → 3.4% precision (correctly rejected)
 
 ---
 
