@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 from src.streetview_utils import slice_perspective
 

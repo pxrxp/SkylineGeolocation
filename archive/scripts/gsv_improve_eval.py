@@ -27,7 +27,7 @@ from pathlib import Path
 from geopy.distance import geodesic
 from scipy.ndimage import gaussian_filter1d
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 

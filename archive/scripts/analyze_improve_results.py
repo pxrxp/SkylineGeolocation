@@ -11,7 +11,7 @@ import sys
 import numpy as np
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 JSON_PATH = ROOT / "data" / "street_view" / "gsv_improve_eval_results.json"
 
 

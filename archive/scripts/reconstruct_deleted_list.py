@@ -3,7 +3,7 @@
 import json, os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 PANOS_DIR = ROOT / "data" / "street_view" / "panos"
 CROPS_DIR = ROOT / "data" / "street_view" / "gsv_crops"
 LOG_PATH = CROPS_DIR / "deleted_crops_log.json"

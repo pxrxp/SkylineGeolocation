@@ -4,7 +4,7 @@ import json, sys, cv2, torch, numpy as np
 from PIL import Image
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from segmentation import load_segmentation_model, refine_sky_mask_with_guidance
