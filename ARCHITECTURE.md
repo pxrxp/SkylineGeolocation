@@ -161,16 +161,33 @@ matching) versus those in enclosed valleys (poor candidates).
 1. **Grid**: regular 30 m spacing in projected coordinates (UTM), converted to
    lat/lon via geodetic forward computation (`pyproj.Geod`)
 2. **Horizon rendering**: uses the [HORAYZON](https://github.com/AppsForBrowsers/HORAYZON)
-   library to compute raw horizon elevation angles from the DEM mesh
-3. **Azimuth bins**: 720 bins covering 0°–360° at 0.5° resolution
-4. **Quantization**: elevation angles stored as `uint8` (0–255 maps linearly
-   to 0°–90°, ~0.35° per step) — see `src/horizon_format.py`
-5. **Storage**: Parquet format with columns including `lon`, `lat`,
+   library to raytrace from observer positions through the DEM mesh
+3. **Rendering parameters** (from `PipelineConfig`):
+   - Search distance: 30 km (determines max visible range)
+   - Eye height: 1.6 m (assumed camera height above ground)
+   - Angular accuracy: 0.1° (HORAYZON convergence tolerance)
+   - Lower elevation limit: -89° (prevents looking straight down)
+   - Azimuth bins: 720 (0.5° resolution, full 360°)
+4. **DEM interpolation**: HORAYZON uses the DEM mesh as a triangle surface;
+   ray-DEM intersection is geometric (no resampling artifacts)
+5. **Quantization**: elevation angles stored as `uint8` (0–255 maps linearly
+   to 0°–90°, 0.353° per step, max error ≤0.18°) — see `src/horizon_format.py`
+6. **Storage**: Parquet format with columns including `lon`, `lat`,
    `elevation_m`, `raw_horizon_deg` (variable-length uint8 arrays)
-6. **Scale**: 1,338,650 viewpoints covering the Khumbu region
+7. **Scale**: 1,338,650 viewpoints covering the Khumbu region
 
-The encoding/decoding is verified: uint8 roundtrip error ≤ ½ quantization
-step (~0.17°), confirmed by brute-force test in `tests/test_core.py`.
+**Storage efficiency:**
+- Raw uint8: 1,338,650 × 720 × 1 byte = 0.96 GB
+- Parquet on disk: 486 MB (2× compression via columnar encoding)
+- Equivalent float32: 3.86 GB (8× larger)
+- Per-row: 0.4 KB (vs 720 bytes raw uint8)
+
+The quantization is lossy but the error (≤0.18°) is below the matching
+resolution (0.5° bins). Verified: uint8 roundtrip error ≤ ½ quantization
+step, confirmed by brute-force test in `tests/test_core.py`.
+
+**Query-time decode**: uint8 → float32 via `decode_horizon_uint8()` for
+NCC matching (which requires float precision for z-scoring and FFT).
 
 ### 3.4 Synthetic Training Data
 
@@ -249,8 +266,11 @@ strength and profile consistency.
 **Stage 1: Coarse spatial scan (Pearson NCC)**
 - Feature extraction: z-scored value + z-scored first derivative
 - Max-over-circular-shifts: tests all 720 heading alignments
-- Shared-FFT scoring (`score_chunk_shared_fft`): DB features computed once
-  per chunk, frequency-domain query multiplication for all panos simultaneously
+- Two implementations (mathematically equivalent, verified by tests):
+  - **Production** (`ncc_scores`): cumsum-based windowed Pearson for single
+    queries; O(N×L) with low constant factor
+  - **Evaluation** (`score_chunk_shared_fft`): FFT-based cross-correlation
+    shared across multiple queries per chunk; ~16× faster for batch scoring
 - Memory-safe streaming: never loads full 1.34M-row DB into RAM
 
 **Three complementary scorers:**
@@ -260,6 +280,12 @@ strength and profile consistency.
 | S0 baseline | value + d1 feature bundle (0.5/0.5) | production default |
 | S1 bp(2,8) | DoG bandpass σ=2→8, plain Pearson | collapses imposter effect on some panos |
 | S2 bp(3,16) | broader bandpass σ=3→16 | captures ridge-scale structure |
+
+**Bandpass implementation**: Difference-of-Gaussians (DoG) in the spatial
+domain via `scipy.ndimage.gaussian_filter1d` with `mode="wrap"` (circular).
+`DoG(σ1,σ2) = Gaussian(σ1) - Gaussian(σ2)`. This acts as a bandpass filter
+that removes both the DC component (mean elevation) and high-frequency noise,
+isolating the mid-scale terrain structure that discriminates locations.
 
 **Stage 2: Fine refinement**
 - Top-K candidates from Stage 1
@@ -276,6 +302,38 @@ strength and profile consistency.
 - Streaming chunked evaluation (4000 rows per chunk)
 - Spatial stride for coarse scan (default 12 → checks every 12th VP)
 - Configurable parameters via `src/config.py` (`PipelineConfig`)
+
+---
+
+## 3A. Configuration Parameters (all defaults)
+
+| Category | Parameter | Value | Rationale |
+|----------|-----------|-------|-----------|
+| **DB** | `grid_spacing_m` | 30 | Matches DEM resolution |
+| | `dist_search_km` | 30 | Max visible range in Khumbu |
+| | `eye_height_m` | 1.6 | Typical handheld camera height |
+| | `hori_acc_deg` | 0.1 | HORAYZON convergence tolerance |
+| | `azim_num` | 720 | 0.5° bins, full 360° |
+| | `batch_size` | 4096 | DB generation batch size |
+| **Profile** | `bin_deg` | 0.5 | Azimuth resolution (720 bins) |
+| | `fov_y_deg` | 65.0 | Default GSV camera vertical FOV |
+| | `median_kernel` | 5 | Post-extraction smoothing |
+| | `min_std_deg` | 1.5 | Minimum profile variation to be usable |
+| | `min_max_elev_deg` | 1.0 | Minimum elevation range to be usable |
+| **Segmentation** | `seg_input_size` | 256 | U-Net input resolution |
+| | `min_sky_ratio` | 0.05 | Reject if sky < 5% of image |
+| | `max_sky_ratio` | 0.95 | Reject if sky > 95% (likely error) |
+| | `min_boundary_coverage` | 0.5 | Need 50% boundary to extract profile |
+| **Matching** | `fft_weights` | (0.5, 0.5) | Equal weight: value + d1 |
+| | `min_corr` | 0.30 | Minimum NCC to consider a match |
+| | `min_score_gap` | 0.03 | Gap between top-1 and top-2 for confidence |
+| | `top_k` | 5 | Candidates kept for DTW refinement |
+| | `dtw_window` | 15 | DTW alignment window (bins) |
+| | `spatial_stride` | 12 | Coarse scan: every 12th VP |
+| **Eval** | `chunk_rows` | 4000 | DB streaming chunk size |
+| | `correct_dist_m` | 500 | Threshold for "correct" match |
+| | `compass_tolerance_deg` | 20 | Compass heading tolerance |
+| | `height_tolerance_m` | 200 | Elevation prior tolerance |
 
 ---
 
@@ -398,7 +456,7 @@ central differences) is future work.
 4. **Coverage**: 2–3 crops cover 30–50% of the 360° horizon; missing
    directions cannot disambiguate
 
-Verified dead ends (see `docs/HISTORICAL_WORKLOG.md` for details):
+Verified dead ends (see `archive/docs/HISTORICAL_WORKLOG.md` for details):
 - Saliency weighting
 - Elevation penalty priors
 - 2D Chamfer re-ranking
