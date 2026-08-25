@@ -3,10 +3,10 @@
 ## Final Methodology & Results — Khumbu (Everest Region), Nepal
 
 > **This is the single authoritative document for the project.**
-> Historical experiment notes live in `docs/HISTORICAL_WORKLOG.md` and are
+> Historical experiment notes live in `archive/docs/` and are
 > superseded — do not cite numbers from there. All numbers below come from
-> the saved result files in `results/` and are reproducible with the scripts
-> in `scripts/`.
+> saved result files in `data/street_view/` and are reproducible with the
+> evaluation scripts in `archive/scripts/`.
 
 ---
 
@@ -323,12 +323,21 @@ abstains.* Consensus hits include localizations of **11 m, 13 m, 23 m, 32 m,
 ### 4.3 Off-Grid Synthetic Evaluation
 
 Queries evaluated at positions between DB grid points (realistic scenario).
-Uses `scripts/offgrid_synthetic_eval.py`:
+Source: `data/street_view/offgrid_eval_results.json`.
 
-- **Noise sweep**: Gaussian noise σ ∈ {0, 0.25, 0.5, 1, 2}° added to
-  synthetic horizons, measuring graceful degradation
-- **FOV sweep**: synthetic queries with coverage from 30° to 360°, measuring
-  the relationship between FOV and matching accuracy
+**Noise robustness** (20 synthetic queries, stride=20 DB scan):
+
+| Noise σ | Median err | Rank-0 | <100 m | <1 km | Med n70 |
+|---------|-----------|--------|--------|-------|----------|
+| 0.0° | 0 m | 100% | 100% | 100% | 1187 |
+| 0.25° | 0 m | 100% | 100% | 100% | 194 |
+| 0.5° | 0 m | 100% | 100% | 100% | 1 |
+| 1.0° | 0 m | 100% | 100% | 100% | 0 |
+| 2.0° | 0 m | 85% | 85% | 95% | 0 |
+| uint8 quant | 0 m | 100% | 100% | 100% | 1187 |
+
+`n70` = number of DB profiles correlating > 0.65 with the query (distinctiveness).
+Low n70 = distinctive profile = trustworthy match.
 
 ### 4.4 What Predicts Success
 
@@ -433,9 +442,7 @@ matching logic against a precomputed horizon database.
 | `notebooks/` | pipeline notebooks (numbered 01–06 by stage) |
 | `data/` | DEMs, models, GSV crops, ground truth |
 | `tests/` | brute-force algorithmic verification suite |
-| `archive/` | historical scripts, evaluation code, deliverable bundle |
-| `app/` | Kivy mobile application |
-| `colab/` | Colab experiment notebooks |
+| `archive/` | historical scripts, evaluation code, dashboards, Streamlit app, Colab notebooks |
 
 ### Reproduction
 

@@ -7,15 +7,12 @@ visible in street-level photographs.
 ## Repository Structure
 
 ```
-src/              Production library (segmentation, matching, DB generation, etc.)
-notebooks/        Pipeline notebooks (numbered by stage)
-data/             DEMs, models, GSV crops, ground truth
-ARCHITECTURE.md   Full methodology, pipeline diagram, results, verification
+src/              Production library (17 modules)
+notebooks/        Pipeline notebooks (numbered 01–06 by stage)
+data/             DEMs, models, GSV crops, ground truth (not in git — 7+ GB)
 tests/            Algorithmic verification suite (11/11 passing)
-app/              Kivy mobile application
-colab/            Colab experiment notebooks
-archive/          Scripts, evaluation code, and deliverable bundle (historical)
-docs/             Historical worklog (superseded, do not cite)
+archive/          Evaluation scripts, dashboards, Streamlit app, Colab notebooks
+ARCHITECTURE.md   Full methodology, pipeline diagram, results, verification
 ```
 
 ## Pipeline Overview
@@ -32,10 +29,11 @@ docs/             Historical worklog (superseded, do not cite)
 
 See `ARCHITECTURE.md` for full details, results, and verification.
 
-## Headline Result
+## Headline Results
 
-**85.7% precision at <1 km** on accepted panoramas (typically tens of meters),
-honest abstention otherwise.
+- **85.7% precision at <1 km** on accepted panoramas (typically tens of meters)
+- **100% accuracy** on synthetic queries up to 1.0° noise
+- **Zero impact** from uint8 quantization storage format
 
 ## Quick Start
 
@@ -45,4 +43,8 @@ conda run -n skyline_env python tests/test_core.py
 
 # full methodology and results:
 cat ARCHITECTURE.md
+
+# run evaluation:
+python archive/scripts/gsv_improve_eval.py --stride 2
+python archive/scripts/offgrid_synthetic_eval.py --samples 20 --stride 20
 ```
