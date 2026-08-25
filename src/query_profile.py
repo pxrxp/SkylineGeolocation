@@ -438,3 +438,111 @@ def compute_column_keep_mask(img, mask, gradient_threshold=8.0):
 
     keep = (boundary_row < H) & (per_col >= gradient_threshold)
     return keep, per_col
+
+
+# ---------------------------------------------------------------------------
+# Multi-crop profile fusion
+# ---------------------------------------------------------------------------
+
+
+def fuse_profiles(crops, gt_data, bin_deg=0.5):
+    """Fuse multiple crops into one wide-FOV elevation profile.
+
+    Each crop's profile is placed into the correct azimuth bin based on
+    its GSV heading. Overlapping bins keep the first valid value.
+    Gaps are linearly interpolated.
+
+    Parameters
+    ----------
+    crops : list of dict
+        Each crop must have 'points' (sky mask annotation), 'heading_deg',
+        'fov_y_deg', and optionally 'cam_R_tilt' and 'sid'.
+    gt_data : dict
+        Ground truth data keyed by crop SID (for camera tilt fallback).
+    bin_deg : float
+        Azimuth bin size in degrees.
+
+    Returns
+    -------
+    fused : np.ndarray or None
+        Interpolated profile of length 360/bin_deg, or None if too few bins.
+    coverage_deg : float
+        Angular coverage of valid (non-interpolated) bins in degrees.
+    """
+    n_bins = int(round(360.0 / bin_deg))
+    joint = np.full(n_bins, np.nan, dtype=np.float32)
+
+    for c in crops:
+        mask = mask_from_points(c["points"])
+        if mask is None:
+            continue
+        H, W = mask.shape
+        fov_y = c.get("fov_y_deg", 65.0)
+
+        sid = c.get("sid", "")
+        gt_entry = gt_data.get(sid) or {}
+        r_tilt = c.get("cam_R_tilt") or gt_entry.get("cam_R_tilt")
+        if r_tilt is not None:
+            r_tilt = np.array(r_tilt)
+
+        skyline_rows = np.full(W, H - 1, dtype=np.int32)
+        for col in range(W):
+            sky_rows = np.where(mask[:, col] == 0)[0]
+            if len(sky_rows) > 0:
+                skyline_rows[col] = sky_rows[-1]
+
+        unclipped = (skyline_rows > 2) & (skyline_rows < H - 2)
+
+        res = extract_elevation_profile(
+            mask,
+            fov_y_deg=fov_y,
+            r_tilt=r_tilt,
+            bin_deg=bin_deg,
+            column_keep_mask=unclipped,
+            azim_frame="camera",
+        )
+        if not res["ok"]:
+            continue
+
+        prof = res["profile"]
+        heading = c.get("heading_deg", 0.0)
+        m = len(prof)
+        center_bin = int(round((heading % 360.0) / bin_deg))
+        half_m = m // 2
+
+        for i in range(m):
+            bin_idx = (center_bin - half_m + i) % n_bins
+            if not np.isnan(prof[i]):
+                joint[bin_idx] = prof[i]
+
+    valid_mask = ~np.isnan(joint)
+    if valid_mask.sum() < 30:
+        return None, 0.0
+
+    cov_deg = float(valid_mask.sum() * bin_deg)
+    all_bins = np.arange(n_bins)
+    valid_idx = all_bins[valid_mask]
+    valid_vals = joint[valid_mask]
+    fused = np.interp(all_bins, valid_idx, valid_vals)
+
+    return fused, cov_deg
+
+
+def mask_from_points(points):
+    """Convert a list of (x, y) boundary points to a binary sky mask.
+
+    Returns mask where 0 = sky, 1 = ground, or None if insufficient points.
+    """
+    if not points or len(points) < 3:
+        return None
+    pts = np.array(points, dtype=np.int32)
+    h = int(np.max(pts[:, 1])) + 2 if len(pts) > 0 else 100
+    w = int(np.max(pts[:, 0])) + 2 if len(pts) > 0 else 100
+    mask = np.ones((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [pts], 0)
+    # Everything above the boundary is sky
+    for col in range(w):
+        sky_rows = np.where(mask[:, col] == 0)[0]
+        if len(sky_rows) > 0:
+            mask[:sky_rows[0], col] = 0
+    return mask

@@ -12,14 +12,7 @@ import numpy as np
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-
-# Works from final/scripts (results copied alongside) OR from repo-root
-# scripts/ (reads data/street_view directly).
-_CANDIDATES = [
-    ROOT / "results" / "gsv_improve_eval_results.json",
-    ROOT / "data" / "street_view" / "gsv_improve_eval_results.json",
-]
-JSON_PATH = next((c for c in _CANDIDATES if c.exists()), _CANDIDATES[0])
+JSON_PATH = ROOT / "data" / "street_view" / "gsv_improve_eval_results.json"
 
 
 def stats(es):
@@ -81,10 +74,10 @@ def main():
         rej = [r["err_rrf"] for r in wide if r["rrf_votes"] < v]
         print(f"reject <{v}   {stats(rej)}")
 
-    # Gate C (diagnostic): true VP ranked in top-50 by how many scorers.
-    # NOTE: only meaningful when ranks were resolvable (rank_i in 0..49);
-    # at coarse scan strides most true VPs are outside the kept top-K,
-    # in which case this table is empty/uninformative.
+    # Gate C: best-scorer error proxy — confident if ANY scorer's top-1 is
+    # close to another scorer's top-1 region cannot be checked without
+    # coordinates; use rank-based proxy instead: true VP ranked in top-50
+    # by >=2 scorers.
     print("\nGate C (diagnostic): true VP in top-50 of how many scorers?")
     from collections import Counter
     cnt = Counter()
@@ -92,17 +85,12 @@ def main():
         n_in = sum(r.get(f"rank_{s}", -1) not in (-1, None)
                    and r[f"rank_{s}"] < 50 for s in scorers[:3])
         cnt[n_in] += 1
-    total_valid = sum(r.get(f"rank_{s}", -1) not in (-1, None, 50)
-                      for r in rs for s in scorers[:3])
-    if total_valid == 0:
-        print("  (no valid ranks recorded at this scan stride - skipped)")
-    else:
-        for k in sorted(cnt):
-            sub = [r["err_rrf"] for r in rs
-                   if sum(r.get(f"rank_{s}", -1) not in (-1, None)
-                          and r[f"rank_{s}"] < 50
-                          for s in scorers[:3]) == k]
-            print(f"  {k} scorers have true-in-top50: N={cnt[k]:<3d} {stats(sub)}")
+    for k in sorted(cnt):
+        sub = [r["err_rrf"] for r in rs
+               if sum(r.get(f"rank_{s}", -1) not in (-1, None)
+                      and r[f"rank_{s}"] < 50
+                      for s in scorers[:3]) == k]
+        print(f"  {k} scorers have true-in-top50: N={cnt[k]:<3d} {stats(sub)}")
 
     print("\n--- Per-sample detail (accepted by Gate A votes>=3) ---")
     for r in sorted(rs, key=lambda x: x["err_rrf"]):

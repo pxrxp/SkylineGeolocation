@@ -626,3 +626,171 @@ def finalize_matches(result_view, query_profile, dtw_window):
 
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates
+
+
+# ---------------------------------------------------------------------------
+# Reciprocal-rank fusion (RRF)
+# ---------------------------------------------------------------------------
+
+
+def rrf_fusion(ranked_lists, k=60):
+    """Reciprocal-rank fusion over multiple scorer ranked lists.
+
+    Parameters
+    ----------
+    ranked_lists : list of list of (row_index, score, ...)
+        Each inner list is one scorer's top-K results, sorted by score desc.
+        Entries can be tuples of any length; only index 0 (row) is used.
+    k : int
+        RRF constant (higher = flatter rank weighting).
+
+    Returns
+    -------
+    fused_scores : dict[int, float]
+        RRF score per row index.
+    best_row : int or None
+        Row with highest fused score.
+    """
+    fused = {}
+    for ranked in ranked_lists:
+        for rank, entry in enumerate(ranked):
+            row = entry[0]
+            fused[row] = fused.get(row, 0.0) + 1.0 / (k + rank)
+    if not fused:
+        return {}, None
+    best_row = max(fused, key=fused.get)
+    return fused, best_row
+
+
+# ---------------------------------------------------------------------------
+# Shared-FFT multi-query scoring (used by gsv_improve_eval)
+# ---------------------------------------------------------------------------
+
+
+def _bandpass(mat, sigma1, sigma2):
+    """Difference-of-Gaussians bandpass, wrapping at edges."""
+    from scipy.ndimage import gaussian_filter1d
+    return (gaussian_filter1d(mat, sigma1, axis=1, mode="wrap")
+            - gaussian_filter1d(mat, sigma2, axis=1, mode="wrap"))
+
+
+def prepare_scorer_states(profiles, bin_deg=0.5):
+    """Build frequency-domain query representations for shared-FFT scoring.
+
+    Parameters
+    ----------
+    profiles : list of np.ndarray
+        Fused query profiles (length N_BINS each).
+    bin_deg : float
+        Angular bin size.
+
+    Returns
+    -------
+    states : list of dict
+        Per-profile scorer states with keys 'baseline', 'bp28', 'bp316',
+        each containing the conjugate FFT of the query feature.
+    """
+    N_BINS = int(round(360.0 / bin_deg))
+    states = []
+    for prof in profiles:
+        q = np.asarray(prof, dtype=np.float64)
+        qv = _safe_zscore(q)
+        qd = _safe_zscore(np.gradient(qv))
+        s = {
+            "baseline": {
+                "spec_v": 0.5 * np.conj(np.fft.rfft(qv)),
+                "spec_d": 0.5 * np.conj(np.fft.rfft(qd)),
+            },
+        }
+        for name, (s1, s2) in [("bp28", (2.0, 8.0)), ("bp316", (3.0, 16.0))]:
+            qb = _safe_zscore(_bandpass(q[None, :], s1, s2)[0])
+            s[name] = {"spec_v": np.conj(np.fft.rfft(qb)), "spec_d": None}
+        states.append(s)
+    return states
+
+
+def score_chunk_shared_fft(states_list, db_chunk, lats, lons, row_start,
+                           scorers=None):
+    """Score all queries against one DB chunk using shared FFT.
+
+    Parameters
+    ----------
+    states_list : list of dict
+        Per-query scorer states from prepare_scorer_states.
+    db_chunk : np.ndarray, shape (N_DB, N_BINS)
+        Raw DB horizon profiles (degrees).
+    lats, lons : np.ndarray, shape (N_DB,)
+        DB row coordinates.
+    row_start : int
+        Global row offset for this chunk.
+    scorers : list of str or None
+        Which scorers to evaluate (default: all three).
+
+    Returns
+    -------
+    results : list of dict
+        Per-query results with keys per scorer: best_score, best_row,
+        best_lat, best_lon, heap (top-K list).
+    """
+    if scorers is None:
+        scorers = ["baseline", "bp28", "bp316"]
+
+    N_BINS = db_chunk.shape[1]
+
+    # DB features (computed once, shared across all queries)
+    zv = _safe_zscore_matrix(db_chunk)
+    zd = _safe_zscore_matrix(np.gradient(zv, axis=1))
+    Fv = np.fft.rfft(zv, axis=1)
+    Fd = np.fft.rfft(zd, axis=1)
+    del zv, zd
+
+    db_bp28 = _safe_zscore_matrix(_bandpass(db_chunk, 2.0, 8.0))
+    Fb28 = np.fft.rfft(db_bp28, axis=1)
+    del db_bp28
+
+    db_bp316 = _safe_zscore_matrix(_bandpass(db_chunk, 3.0, 16.0))
+    Fb316 = np.fft.rfft(db_bp316, axis=1)
+    del db_bp316
+
+    results = []
+    for st in states_list:
+        res = {}
+        for scorer in scorers:
+            spec = st[scorer]
+            if scorer == "baseline":
+                cb = (np.fft.irfft(spec["spec_v"][None, :] * Fv,
+                                   n=N_BINS, axis=1)
+                      + np.fft.irfft(spec["spec_d"][None, :] * Fd,
+                                     n=N_BINS, axis=1)) / N_BINS
+            elif scorer == "bp28":
+                cb = np.fft.irfft(spec["spec_v"][None, :] * Fb28,
+                                  n=N_BINS, axis=1) / N_BINS
+            elif scorer == "bp316":
+                cb = np.fft.irfft(spec["spec_v"][None, :] * Fb316,
+                                  n=N_BINS, axis=1) / N_BINS
+            else:
+                continue
+
+            best_j = int(np.argmax(cb))
+            best_score = float(cb[0, best_j])
+            best_row = row_start + best_j
+            best_lat = float(lats[best_j])
+            best_lon = float(lons[best_j])
+
+            # Collect top-K for RRF
+            flat = cb[0]
+            top_k = min(50, len(flat))
+            idx = np.argpartition(-flat, top_k)[:top_k]
+            idx = idx[np.argsort(-flat[idx])]
+            heap = [(float(flat[i]), row_start + int(i),
+                     float(lats[i]), float(lons[i])) for i in idx]
+
+            res[scorer] = {
+                "best_score": best_score,
+                "best_row": best_row,
+                "best_lat": best_lat,
+                "best_lon": best_lon,
+                "heap": heap,
+            }
+        results.append(res)
+    return results

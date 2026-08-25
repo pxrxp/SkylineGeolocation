@@ -1,82 +1,90 @@
-# Skyline-Based Image Geolocation in High-Relief Terrain
+# Skyline-Based Image Geolocation
 
-**Khumbu (Everest region), Nepal — mountain-skyline-only localization from street-level photos.**
+Mountain skyline matching for camera localization in the Khumbu Himalaya (Everest region), Nepal. No GPS, no landmarks — only the mountain horizon visible in street-level photographs.
 
-Given one or more photos, estimate the camera's geographic position using
-only the mountain skyline: no GPS, no landmarks, no roads or buildings
-(none exist at useful scale in this terrain). This folder is the complete,
-self-contained deliverable: methodology, results, source code, evaluation
-scripts, and figures.
+## What This Is
 
----
+A complete pipeline from raw DEMs to camera geolocation:
 
-## Headline results
+1. **Data preparation**: DEM download, viewshed analysis, horizon database generation (1.34M viewpoints via HORAYZON)
+2. **Training data**: GeoPose3K dataset + synthetic mountain scenes (DEM + satellite texture + cloud backdrops via pyrender)
+3. **Sky segmentation**: U-Net trained on GeoPose3K + synthetic data, with multi-scale edge refinement post-processing
+4. **Profile extraction**: Camera geometry converts sky masks to 720-bin elevation profiles
+5. **Matching**: Three complementary NCC scorers (baseline, bandpass σ2-8, bandpass σ3-16) with reciprocal-rank fusion
+6. **Confidence gating**: Reports matches only when all scorers agree; abstains otherwise
 
-| Claim | Number |
-|---|---|
-| **Precision when the system reports a match** (wide-FOV ≥200° + cross-scorer consensus) | **85.7% correct at <1 km, median ≈ 40 m** (6/7 hits < 100 m; best 11 m) |
-| Accuracy when it abstains | rejected panos would have been only 3–6% right — gating removes noise |
-| Best ungated matcher (RRF fusion of 3 scorers) | median 15.8 km overall; **12.8 km / 28% <100 m** on wide-FOV subset |
-| vs production baseline | +34% relative pinpoint (<100 m) accuracy overall, **+40%** on wide-FOV |
-| Oracle ceiling (best scorer per pano, wide-FOV) | 4.8 km median, 32% < 1 km |
+**Headline result**: 85.7% precision at <1 km on accepted panoramas (typically tens of meters), honest abstention otherwise.
 
-**How to read this:** skyline matching alone identifies the correct *region*
-(10–15 km) for most photos and *pinpoints* (tens of meters) a subset with
-distinctive terrain. The system detects when it can pinpoint (scorer
-consensus) and reports nothing otherwise — that trade is deliberate and is
-the core result.
+## Project Layout
 
-## Quick start
+```
+src/                  Production library
+  skyline.py            Horizon database generation (HORAYZON + Parquet)
+  segmentation.py       U-Net sky segmentation + post-processing
+  matching.py           Pearson NCC, bandpass, RRF fusion
+  query_profile.py      Sky mask → elevation profile extraction
+  synthetic_generator.py  Synthetic mountain scene generation
+  viewshed.py           Viewshed/visibility analysis
+  evaluation.py         Streaming DB evaluation
+  region.py             Geographic bounds definition
+  config.py             Pipeline configuration
+  horizon_format.py     uint8 horizon encoding/decoding
 
-```bash
-conda activate skyline_env   # or: conda run -n skyline_env <cmd>
+scripts/              Evaluation, analysis, and figure scripts
+  gsv_improve_eval.py    Main benchmark: 3 scorers + RRF on fused profiles
+  analyze_improve_results.py  Post-hoc confidence table from saved results
+  offgrid_synthetic_eval.py   Off-grid noise/FOV robustness evaluation
+  calibrate_and_eval_multiphoto.py  Honest multi-photo evaluation
+  make_report_figures.py   Publication figures (fig1-fig4)
+  ...
 
-# tables + confidence gates from saved results (instant, no DB needed)
-python scripts/analyze_improve_results.py
+notebooks/            Jupyter notebooks (numbered by pipeline stage)
+  01_RegionStudy/       Region bounds, DEM download, viewshed analysis
+  02_SkylineDatabase/   Horizon DB generation, visualization
+  03_SyntheticData/     Cloud/texture download, synthetic scene generation
+  04_SkySegmentation/   GeoPose3K download, U-Net training, testing
+  05_SkylineMatching/   Matching evaluation and sensor study
+  06_GSV_Evaluation/    Final results report
 
-# publication figures fig1–fig4 (~30 s, no DB needed)
-python scripts/make_report_figures.py
-
-# core-algorithm verification against brute-force references (11 tests)
-python tests/test_core.py
-
-# full benchmark (needs skyline_db.parquet, ~30 min)
-python scripts/gsv_improve_eval.py --stride 2
+tests/                Algorithmic verification (brute-force references)
+final/                Self-contained deliverable bundle
+  METHODOLOGY.md       Complete methodology (source of truth)
+  RESULTS.md           Full result tables
+  src/                 Snapshot of production source
+  scripts/             Snapshot of evaluation scripts
+  results/             Raw JSON backing every claimed number
+  figures/             Publication figures (PNG + PDF)
+  docs/                Historical worklog (superseded)
 ```
 
-All scripts work whether run from inside `final/` or from the repository
-root — paths are resolved automatically.
+## Quick Start
 
-## How this folder is organized
+```bash
+# verify algorithm correctness (11/11 tests):
+conda run -n skyline_env python tests/test_core.py
 
-| Path | What it is |
-|---|---|
-| [`METHODOLOGY.md`](METHODOLOGY.md) | **Start here.** Authoritative methodology + results + verification + limitations |
-| [`RESULTS.md`](RESULTS.md) | Full result tables incl. per-sample detail for all 68 panoramas |
-| `src/` | Production source: sky segmentation, profile extraction, matching, eval |
-| `scripts/` | Evaluation & figure scripts (see quick start) |
-| `results/` | Raw JSON outputs backing every number quoted in the docs |
-| `figures/` | Publication figures (PNG + PDF): error CDFs, confidence gates, baseline-vs-fusion scatter, coverage-vs-error |
-| `tests/` | Logic tests comparing optimized matchers against independent brute-force references |
-| `docs/HISTORICAL_WORKLOG.md` | Raw experiment log — **superseded, do not cite numbers from it** |
+# confidence tables from saved results (instant):
+python scripts/analyze_improve_results.py
 
-## Method in one paragraph
+# figures (instant):
+python scripts/make_report_figures.py
 
-U-Net sky segmentation → geometric horizon→elevation profiles at 0.5°
-azimuth bins → multi-crop fusion into one wide-field-of-view profile →
-three complementary Pearson-NCC scorers over 1.34M DEM-simulated horizon
-profiles (baseline value+gradient, DoG bandpass bp(2,8), bp(3,16)) →
-reciprocal-rank score fusion → **confidence gate: report only when all
-three scorers independently agree on the same location, otherwise abstain**.
+# full benchmark (needs skyline DB, ~30 min):
+python scripts/gsv_improve_eval.py --stride 2
 
-## Key facts & integrity notes
+# off-grid synthetic evaluation (~15 min):
+python scripts/offgrid_synthetic_eval.py --samples 40
+```
 
-* Database: 1,338,650 viewpoint horizons (HORAYZON × Copernicus GLO-30, 30 m DEM).
-* Queries: 68 multi-crop GSV panoramas, Khumbu region.
-* No ground-truth leakage: an early prototype calibrated camera pitch using
-  the true viewpoint's horizon; that result was invalidated and excluded.
-* Known limitation (documented, quantified at ~1–3×10⁻³ NCC): azimuth-seam
-  artifact in the gradient feature — see METHODOLOGY §5.2.
-* Fundamental limit: at 30 m DEM resolution many distinct locations share
-  near-identical horizon shapes ("imposter effect"); sub-km precision for
-  all photos requires a GPS prior or higher-resolution DEM (METHODOLOGY §6–8).
+## Key Results
+
+| Scenario | Precision <1km | Notes |
+|----------|---------------|-------|
+| Wide-FOV + scorer consensus | **85.7%** | N=7 accepted, median ~40m |
+| Any-FOV + consensus | 70.0% | N=10 accepted |
+| No gating (baseline) | 11.8% | All 68 panos counted |
+| Oracle (best scorer/pano) | 32.0% | Wide-FOV upper bound |
+
+## Mobile Deployment
+
+A Kivy-based mobile application replicates the full pipeline for on-device use.

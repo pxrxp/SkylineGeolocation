@@ -37,12 +37,7 @@ from geopy.distance import geodesic
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from horizon_format import decode_horizon_column
 
-# Resolve repo root from nearest ancestor containing data/street_view
-# (works both from final/scripts and repo-root scripts/).
-_here = Path(__file__).resolve()
-ROOT = next((p for p in [_here.parent.parent, *_here.parents]
-             if (p / "data" / "street_view").exists()),
-            _here.parent.parent)
+ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "notebooks" / "02_SkylineDatabase" / "output" / "skyline_db.parquet"
 BIN_DEG = 0.5
 
