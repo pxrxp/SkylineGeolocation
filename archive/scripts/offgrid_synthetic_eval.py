@@ -137,9 +137,11 @@ def score_chunk(queries_bundle, db_chunk):
     Fd_d = np.fft.rfft(db_d1, axis=1)
     del db_val, db_d1
 
-    # irfft(conj(q) * d) gives cross-correlation for each query vs all DB rows
-    cv = np.fft.irfft(Fq_v[:, None, :] * Fd_v[None, :, :], n=N_BINS, axis=2)
-    cd = np.fft.irfft(Fq_d[:, None, :] * Fd_d[None, :, :], n=N_BINS, axis=2)
+    # irfft(conj(q) * d) gives unnormalised cross-correlation.
+    # Divide by N_BINS to get Pearson NCC (features are z-scored, so
+    # sum(q*d)/L = Pearson correlation at that shift).
+    cv = np.fft.irfft(Fq_v[:, None, :] * Fd_v[None, :, :], n=N_BINS, axis=2) / N_BINS
+    cd = np.fft.irfft(Fq_d[:, None, :] * Fd_d[None, :, :], n=N_BINS, axis=2) / N_BINS
     combined = 0.5 * cv + 0.5 * cd  # (n_q, n_chunk, N_BINS)
     return combined.max(axis=2)  # (n_q, n_chunk) best over all shifts
 
