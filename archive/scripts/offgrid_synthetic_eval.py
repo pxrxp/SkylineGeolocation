@@ -69,9 +69,9 @@ def pick_offgrid_positions(meta, n_samples, rng):
 
 def render_horizons_at_positions(vert_grid, meta, xs, ys, n_bins=N_BINS):
     n = len(xs)
-    # Sample DEM elevation at each position from the mesh vertex grid.
-    # vert_grid shape: (dem_dim_0, dem_dim_1, 3) where [:,:,2] = elevation.
-    # Observer positions are between grid points, so nearest-neighbor sample.
+    # Sample DEM elevation at each position from the mesh vertex buffer.
+    # vert_grid is a flat interleaved [x,y,z,x,y,z,...] buffer from
+    # hray.auxiliary.rearrange_pad_buffer, with SSE padding at the end.
     px_w = abs(meta["px_w"])
     start_x = meta["start_x"]
     start_y = meta["start_y"]
@@ -79,7 +79,9 @@ def render_horizons_at_positions(vert_grid, meta, xs, ys, n_bins=N_BINS):
     dim1 = meta["dem_dim_1"]
     cols = np.clip(np.round((xs - start_x) / px_w).astype(int), 0, dim1 - 1)
     rows = np.clip(np.round((ys - start_y) / px_w).astype(int), 0, dim0 - 1)
-    zs = vert_grid[rows, cols, 2].astype(np.float32)
+    # z is every 3rd element starting at index 2, first dim0*dim1 vertices
+    idx = (rows * dim1 + cols) * 3 + 2
+    zs = vert_grid[idx].astype(np.float32)
     coords = np.column_stack([
         xs.astype(np.float32),
         ys.astype(np.float32),
