@@ -1,5 +1,5 @@
 # ====================================================================
-# 1. Heavy Datasets & GIS Data (Saves ~66 GB)
+# 1. Heavy Datasets & GIS Data (~66 GB on disk, not in git)
 # ====================================================================
 data/geopose3k/
 data/digital_elevation_model/
@@ -8,24 +8,27 @@ data/synthetic_dataset/
 data/satellite_imagery/
 data/clouds/
 data/test_segmentation
-
-# Ignore any model checkpoints in the root data folder
 data/*.pth
 
-# ====================================================================
-# 2. Pipeline Outputs & Temp Files (Saves ~1 GB)
-# ====================================================================
-tmp/
-notebooks/01_RegionStudy/output/
-notebooks/02_SkylineDatabase/output/
-notebooks/*/output/
-
-# Eval outputs, per-sample corr caches, DB backups
+# Pipeline outputs, per-sample corr caches, DB backups
 data/eval/
 data/db_backup/
 
 # ====================================================================
-# 3. IDE, Jupyter & OS Metadata
+# 2. Third-party DB generator (built locally)
+# ====================================================================
+HORAYZON/build/
+HORAYZON/dist/
+HORAYZON/
+
+# ====================================================================
+# 3. Pipeline temp outputs
+# ====================================================================
+tmp/
+notebooks/*/output/
+
+# ====================================================================
+# 4. IDE, Jupyter & OS metadata
 # ====================================================================
 .ipynb_checkpoints/
 .virtual_documents/
@@ -33,21 +36,16 @@ data/db_backup/
 Thumbs.db
 
 # ====================================================================
-# 4. Python/C++ Build Artifacts & Virtual Environments
+# 5. Python build artifacts, caches & logs
 # ====================================================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
-HORAYZON/build/
-HORAYZON/dist/
 venv/
 env/
+.pytest_cache/
+.ruff_cache/
+*.log
 
-*.MD
-*.md
 .env
-
-HORAYZON/
-
-diagnose.py
