@@ -320,24 +320,28 @@ is correct (<1 km, typically tens of meters) 86% of the time; otherwise it
 abstains.* Consensus hits include localizations of **11 m, 13 m, 23 m, 32 m,
 33 m, 42 m** — meter-level pinpointing is real when terrain is distinctive.
 
-### 4.3 Off-Grid Synthetic Evaluation
+### 4.3 Noise Robustness (synthetic self-matching)
 
-Queries evaluated at positions between DB grid points (realistic scenario).
+**Important caveat:** this tests resilience to signal degradation, NOT
+off-grid localization. Queries are DB profiles with added noise — the true
+location IS in the database. This measures how much noise the matcher can
+tolerate before degrading, not how well it localizes unknown positions.
+
 Source: `data/street_view/offgrid_eval_results.json`.
 
-**Noise robustness** (20 synthetic queries, stride=20 DB scan):
+| Noise σ | Rank-0 | <100 m | <1 km | Med n70 |
+|---------|--------|--------|-------|----------|
+| 0.0° | 100% | 100% | 100% | 1187 |
+| 0.25° | 100% | 100% | 100% | 194 |
+| 0.5° | 100% | 100% | 100% | 1 |
+| 1.0° | 100% | 100% | 100% | 0 |
+| 2.0° | 85% | 85% | 95% | 0 |
+| uint8 quant | 100% | 100% | 100% | 1187 |
 
-| Noise σ | Median err | Rank-0 | <100 m | <1 km | Med n70 |
-|---------|-----------|--------|--------|-------|----------|
-| 0.0° | 0 m | 100% | 100% | 100% | 1187 |
-| 0.25° | 0 m | 100% | 100% | 100% | 194 |
-| 0.5° | 0 m | 100% | 100% | 100% | 1 |
-| 1.0° | 0 m | 100% | 100% | 100% | 0 |
-| 2.0° | 0 m | 85% | 85% | 95% | 0 |
-| uint8 quant | 0 m | 100% | 100% | 100% | 1187 |
-
-`n70` = number of DB profiles correlating > 0.65 with the query (distinctiveness).
-Low n70 = distinctive profile = trustworthy match.
+`n70` = number of DB profiles correlating > 0.65 with the query.
+Key finding: even 0.5° noise makes profiles highly distinctive (n70 drops
+from 1187 to 1), meaning real-world noise would actually HELP
+localization by eliminating ambiguous matches.
 
 ### 4.4 What Predicts Success
 

@@ -32,7 +32,7 @@ See `ARCHITECTURE.md` for full details, results, and verification.
 ## Headline Results
 
 - **85.7% precision at <1 km** on accepted panoramas (typically tens of meters)
-- **100% accuracy** on synthetic queries up to 1.0° noise
+- **Noise robustness**: matcher tolerates up to 1.0° noise with no degradation
 - **Zero impact** from uint8 quantization storage format
 
 ## Quick Start
