@@ -130,16 +130,15 @@ def score_chunk(queries_bundle, db_chunk):
     q_val, q_d1 = queries_bundle  # each (n_q, N_BINS)
     db_val, db_d1 = feature_bundle(db_chunk)
 
-    # FFT-based cross-correlation
-    Fq_v = np.fft.rfft(q_val, axis=1)
-    Fq_d = np.fft.rfft(q_d1, axis=1)
+    # FFT-based Pearson-normalised circular cross-correlation.
+    # irfft(conj(q) * d) / L gives Pearson correlation at each shift.
+    # WITHOUT conj() this computes convolution (garbage).
+    Fq_v = np.conj(np.fft.rfft(q_val, axis=1))
+    Fq_d = np.conj(np.fft.rfft(q_d1, axis=1))
     Fd_v = np.fft.rfft(db_val, axis=1)
     Fd_d = np.fft.rfft(db_d1, axis=1)
     del db_val, db_d1
 
-    # irfft(conj(q) * d) gives unnormalised cross-correlation.
-    # Divide by N_BINS to get Pearson NCC (features are z-scored, so
-    # sum(q*d)/L = Pearson correlation at that shift).
     cv = np.fft.irfft(Fq_v[:, None, :] * Fd_v[None, :, :], n=N_BINS, axis=2) / N_BINS
     cd = np.fft.irfft(Fq_d[:, None, :] * Fd_d[None, :, :], n=N_BINS, axis=2) / N_BINS
     combined = 0.5 * cv + 0.5 * cd  # (n_q, n_chunk, N_BINS)
@@ -244,24 +243,39 @@ def run_offgrid(n_samples=20, seed=42, output_path=None,
         if n_scanned_global >= max(nearest_idx) + 1:
             break
 
-    # Compute true-vs-nearest correlation (baseline: how correlated are
-    # off-grid horizons with their nearest DB grid point?)
+    # Compute ceiling: max-over-shifts correlation with nearest DB point
+    # (uses same FFT pipeline as matching, but only the true nearest row)
     true_val, true_d1 = feature_bundle(offgrid_horizons)
     nearest_val, nearest_d1 = feature_bundle(nearest_hORIZONS)
-    # Pearson correlation per query (value channel, mean-centered)
+
+    # Ceiling = max-over-shifts Pearson NCC with nearest DB row
+    Fq_v = np.conj(np.fft.rfft(true_val, axis=1))
+    Fq_d = np.conj(np.fft.rfft(true_d1, axis=1))
+    Fn_v = np.fft.rfft(nearest_val, axis=1)
+    Fn_d = np.fft.rfft(nearest_d1, axis=1)
+    cv_n = np.fft.irfft(Fq_v * Fn_v, n=N_BINS, axis=1) / N_BINS
+    cd_n = np.fft.irfft(Fq_d * Fn_d, n=N_BINS, axis=1) / N_BINS
+    ceiling_corr = np.max(0.5 * cv_n + 0.5 * cd_n, axis=1)  # best shift per query
+
+    # Also compute direct Pearson (shift=0) for reference
     def _pearson_corr(a, b):
         a_z = a - a.mean()
         b_z = b - b.mean()
         return float(np.sum(a_z * b_z) / (np.linalg.norm(a_z) * np.linalg.norm(b_z) + 1e-12))
 
-    true_nearest_corr = np.array([
+    direct_corr = np.array([
         0.5 * _pearson_corr(true_val[qi], nearest_val[qi]) +
         0.5 * _pearson_corr(true_d1[qi], nearest_d1[qi])
         for qi in range(n_samples)
     ])
-    print(f"True vs nearest DB correlation: median={np.median(true_nearest_corr):.4f}, "
-          f"range=[{true_nearest_corr.min():.4f}, {true_nearest_corr.max():.4f}]")
-    print(f"  (This is the ceiling — how well can any matcher do on off-grid positions?)")
+
+    print(f"Ceiling (max-shift NCC with nearest DB): median={np.median(ceiling_corr):.4f}")
+    print(f"Direct Pearson (shift=0):                median={np.median(direct_corr):.4f}")
+    print(f"  Range: [{ceiling_corr.min():.4f}, {ceiling_corr.max():.4f}]")
+    print(f"  (This is the best any matcher can do on off-grid positions)")
+
+    # Use ceiling_corr as the reference for corr_drop
+    true_nearest_corr = ceiling_corr
 
     # Compute errors
     all_results = []
@@ -337,7 +351,7 @@ def run_offgrid(n_samples=20, seed=42, output_path=None,
 
     # Save
     if output_path is None:
-        output_path = ROOT / "data" / "street_view" / "offgrid_eval_results.json"
+        output_path = ROOT / "archive" / "synthetic_results" / "offgrid_eval_results.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(all_results, f, indent=2)

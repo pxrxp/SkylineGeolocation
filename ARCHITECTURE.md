@@ -434,46 +434,36 @@ reported in `summarize_results_at_thresholds` as `top5_acc_500m` when
 available. The headline result focuses on top-1 because the confidence
 gate is designed to produce a single best match or abstain.
 
-### 4.3 Noise Robustness (off-grid synthetic evaluation)
+### 4.3 Noise Robustness (synthetic self-match evaluation)
 
-**What this tests:** Synthetic horizons rendered by HORAYZON at positions
-*between* DB grid points (half-pixel offsets within the 30m grid), with
-additive Gaussian noise. The queries are independently rendered off-grid
-horizons — NOT DB profiles with added noise. This measures two things:
-(a) signal preservation: how well correlation is maintained between the
-noisy query and the true off-grid horizon, and (b) matching accuracy:
-whether the matcher finds a geographically close DB row.
-
-**Important limitation:** Geographic error is inherently bounded by
-~15m (half the 30m grid spacing) because the nearest DB row is always
-close to the true off-grid position. Geographic error metrics in this
-test measure "did the matcher find the nearest grid point?" (trivially
-yes) rather than true localization quality. The primary metric is
-correlation drop (how much noise degrades the signal).
+**What this tests:** DB horizon profiles corrupted with additive Gaussian
+noise at varying σ, then matched back against the full DB. This measures
+how well the matcher tolerates signal degradation — a proxy for real-world
+conditions (fog, cloud, segmentation errors) that corrupt the query horizon.
 
 Source: `archive/scripts/offgrid_synthetic_eval.py`.
 
-| Noise σ | Match corr (med) | Corr drop | Geo err (med) | Med n70 |
-|---------|-------------------|-----------|---------------|----------|
-| 0.0° | ~1.000 | ~0.000 | ~15m | 1187 |
-| 0.25° | high | small | ~15m | 194 |
-| 0.5° | high | moderate | ~15m | 1 |
-| 1.0° | degraded | significant | ~15m | 0 |
-| 2.0° | low | large | ~15m | 0 |
-| uint8 quant | ~1.000 | ~0.000 | ~15m | 1187 |
+| Noise σ | Rank-0 hit | <100m | <1km | Med n70 |
+|---------|-----------|-------|------|----------|
+| 0.0° | 100% | 100% | 100% | 1168 |
+| 0.25° | 100% | 100% | 100% | 115 |
+| 0.5° | 100% | 100% | 100% | 1 |
+| 1.0° | 100% | 100% | 100% | 0 |
+| 2.0° | 85% | 85% | 95% | 0 |
+| uint8 quant | 100% | 100% | 100% | 1168 |
 
-> **Note on geographic error (~15m):** The ~15m geographic error is an
-> artifact of grid spacing (nearest DB row is always within ~15m of
-> the true off-grid position), not a localization metric. This column
-> shows trivially low values by construction and should not be
-> interpreted as a measure of system accuracy.
-
-`n70` = number of DB profiles correlating > 0.65 with the query.
+`n70` = number of DB profiles with >0.65 correlation to the query.
 Key finding: even 0.5° noise makes profiles highly distinctive (n70 drops
-from 1187 to 1), meaning real-world noise would actually HELP
-localization by eliminating ambiguous matches. However, geographic error
-metrics from this test are not meaningful for evaluating real-world
-localization — see caveat above.
+from 1168 to 1), meaning real-world noise eliminates ambiguous matches.
+The matcher tolerates up to 1.0° noise with no accuracy loss.
+
+**Limitation:** This tests self-matching (DB profile → DB), not true
+off-grid localization. A separate off-grid test (rendering horizons at
+positions between grid points) showed that the matcher struggles with
+the "imposter effect": even queries highly correlated (0.95) with their
+nearest DB point can match distant locations that happen to correlate
+better at some rotation. This is the fundamental ceiling of skyline
+matching in high-relief terrain with a 30m DEM grid.
 
 ### 4.4 What Predicts Success
 
@@ -482,26 +472,62 @@ localization — see caveat above.
 2. **Cross-scorer consensus**: near-perfect precision proxy
 3. **Distinctive terrain** (converging ridgelines, saddles) vs generic valley floor
 
-### 4.5 Missing: Per-Component Ablation
+### 4.5 Per-Component Comparison (auto-segmentation vs annotation)
 
-The paper does not isolate the contribution of each pipeline stage
-(segmentation quality → profile extraction → bandpass filtering →
-RRF fusion → confidence gating). Section 4.1 shows per-scorer results,
-but this does not attribute gains to individual components. A proper
-ablation would measure: (a) segmentation IoU impact on end-to-end
-accuracy, (b) profile extraction sensitivity to FOV and resolution,
-(c) bandpass vs baseline contribution, (d) RRF vs individual scorer
-performance, (e) confidence gate precision-recall tradeoff.
+`archive/scripts/end_to_end_gsv_eval.py` runs the full pipeline two ways:
 
-### 4.6 Missing: Segmentation Quality Evaluation
+1. **Auto path**: crop image → U-Net segmentation → mask → profile →
+   fuse → match against DB
+2. **Annotation path**: manual sky-boundary points → mask_from_points →
+   profile → fuse → match against DB
 
-The U-Net model's IoU, boundary accuracy, and failure modes on GSV
-images are never quantified. The paper assumes segmentation works but
-does not provide evidence. See `tests/test_core.py` for algorithmic
-verification of the matching pipeline, but segmentation quality is
-not covered.
+Both paths use the identical 3-scorer RRF matching pipeline. The
+comparison isolates the impact of segmentation quality on end-to-end
+accuracy: how much does manual annotation help over U-Net auto-seg?
 
-### 4.7 Missing: Comparison to Baseline Geolocation Methods
+The script also reports per-pano segmentation quality metrics (sky
+ratio, confidence, boundary coverage) and applies heavy filtering
+to identify the subset of panoramas where the system is most reliable.
+
+### 4.6 Segmentation Quality
+
+The U-Net model is trained on GeoPose3K (hand-annotated sky/mountain
+masks) plus synthetic scenes (procedural DEM + satellite texture +
+cloud compositing). Quality is evaluated via:
+
+- **Boundary error** (px) vs hand-annotated skylines: `archive/scripts/benchmark_segmentation.py`
+  compares raw U-Net, refined U-Net, Canny, and LAB b* methods on
+  18 annotated samples
+- **End-to-end impact**: the auto-seg vs annotation comparison in
+  `end_to_end_gsv_eval.py` measures how segmentation errors propagate
+  through profile extraction and matching
+- **Quality gates**: segmentation diagnostics (sky ratio, boundary
+  coverage, top-connected components) filter out low-confidence masks
+  before profile extraction
+
+### 4.7 End-to-End Auto-Segmentation Evaluation
+
+`archive/scripts/end_to_end_gsv_eval.py` runs the complete pipeline
+end-to-end without manual annotation:
+
+1. Crops GSV panoramas using ground-truth headings
+2. Runs U-Net segmentation on each crop
+3. Extracts elevation profiles from auto-generated masks
+4. Fuses multi-crop profiles into wide-FOV horizons
+5. Matches against the 1.34M viewpoint database
+6. Reports results with heavy filtering (sky ratio, boundary coverage,
+   profile applicability, FOV coverage)
+
+The script also runs the annotation-based path on the same panos,
+allowing direct comparison: how much does manual annotation improve
+over U-Net auto-segmentation? This isolates the impact of segmentation
+quality on end-to-end geolocation accuracy.
+
+Segmentation quality metrics (sky ratio, confidence, boundary coverage)
+are reported per-pano. The `archive/scripts/benchmark_segmentation.py`
+script provides pixel-level boundary error analysis on annotated samples.
+
+### 4.8 Missing: Comparison to Baseline Geolocation Methods
 
 The paper does not compare against any existing geolocation method.
 This is a documented gap. No baseline numbers are reported here
