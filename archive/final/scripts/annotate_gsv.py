@@ -835,7 +835,7 @@ document.getElementById('btn_save').onclick = () => sendAction('annotate', {});
 document.getElementById('btn_skip').onclick = () => sendAction('skip', {});
 
 function apply(d) {
-  if (d.error) { busy = false; return; }
+  if (d.error) { busy = false; document.getElementById('status').textContent = d.error; return; }
   cur = d;
   pts = d.points || [];
   img.src = d.img;
