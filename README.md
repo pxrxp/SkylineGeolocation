@@ -1,52 +1,48 @@
-# Skyline Geolocation — Khumbu (Everest Region)
+# Skyline-Based Image Geolocation
 
-Localize street-level photos from the **mountain skyline alone** — no GPS,
-no landmarks, no roads or buildings. Region of study: Khumbu Himalaya,
-Nepal (fog, steep relief, 30 m global DEM).
+Mountain skyline matching for camera localization in the Khumbu Himalaya
+(Everest region), Nepal. No GPS, no landmarks — only the mountain horizon
+visible in street-level photographs.
 
-> **Deliverable:** everything needed for the report lives in
-> [`final/`](final/) — start with [`final/README.md`](final/README.md)
-> and [`final/METHODOLOGY.md`](final/METHODOLOGY.md).
->
-> **Headline:** when three independent skyline matchers agree, the system
-> pinpoints the camera to **<1 km at 86% precision (median ≈ 40 m)** and
-> abstains otherwise.
-
-## Repository layout
+## Repository Structure
 
 ```
-src/            production library (segmentation, matching, profiles, eval)
-notebooks/      numbered study notebooks (region → database → data → training → matching → results)
-scripts/        curated pipeline + evaluation scripts
-scripts/archive/ one-off experiments & diagnostics (kept for reference)
-tests/          core-algorithm logic tests (vs brute-force references)
-final/          self-contained deliverable: methodology, results, figures
-docs/           historical planning docs & experiment worklog
-colab/          Colab-era working notebooks
-app/            demo app
-data/           datasets & DB (gitignored; see .gitignore)
+src/              Production library (segmentation, matching, DB generation, etc.)
+notebooks/        Pipeline notebooks (numbered by stage)
+data/             DEMs, models, GSV crops, ground truth
+ARCHITECTURE.md   Full methodology, pipeline diagram, results, verification
+tests/            Algorithmic verification suite (11/11 passing)
+app/              Kivy mobile application
+colab/            Colab experiment notebooks
+archive/          Scripts, evaluation code, and deliverable bundle (historical)
+docs/             Historical worklog (superseded, do not cite)
 ```
 
-## Setup
+## Pipeline Overview
+
+1. **Region & DEM** → Copernicus GLO-30 (30 m) over Khumbu
+2. **Horizon DB** → 1.34M viewpoints via HORAYZON, stored as uint8 Parquet
+3. **Synthetic data** → DEM mesh + satellite texture + cloud backdrops (pyrender)
+4. **Sky segmentation** → U-Net trained on GeoPose3K + synthetic data
+5. **Profile extraction** → Sky mask → 720-bin elevation profile per crop
+6. **Multi-crop fusion** → Wide-FOV profiles (200°–262°)
+7. **3-scorer matching** → Baseline NCC + bandpass σ(2,8) + bandpass σ(3,16)
+8. **RRF fusion** → Reciprocal-rank fusion of top-50 lists
+9. **Confidence gating** → Report only when all scorers agree; abstain otherwise
+
+See `ARCHITECTURE.md` for full details, results, and verification.
+
+## Headline Result
+
+**85.7% precision at <1 km** on accepted panoramas (typically tens of meters),
+honest abstention otherwise.
+
+## Quick Start
 
 ```bash
-conda env create -f environment.yml
-conda activate skyline_env
-bash setup.sh          # HORAYZON build + data downloads if needed
-```
+# verify algorithm correctness (11/11 tests):
+conda run -n skyline_env python tests/test_core.py
 
-## Typical workflow
-
-1. `notebooks/01_RegionStudy/` — define region, download DEMs, viewshed
-2. `notebooks/02_SkylineDatabase/` — generate the horizon database
-   (1.34M viewpoints, Copernicus GLO-30 via HORAYZON)
-3. `notebooks/03_SyntheticData/` + `04_SkySegmentation/` — training data
-   and U-Net sky segmentation
-4. `notebooks/05_SkylineMatching/` — matching evaluation & sensor study
-5. `notebooks/06_GSV_Evaluation/` — final GSV benchmark & report figures
-
-## Verification
-
-```bash
-python tests/test_core.py     # 11 logic tests vs brute-force references
+# full methodology and results:
+cat ARCHITECTURE.md
 ```

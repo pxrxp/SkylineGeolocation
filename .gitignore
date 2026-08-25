@@ -49,3 +49,16 @@ env/
 *.log
 
 .env
+
+# ====================================================================
+# 6. Archive caches (scripts were temporary)
+# ====================================================================
+archive/scripts/__pycache__/
+archive/final/scripts/__pycache__/
+archive/final/src/__pycache__/
+archive/final/tests/__pycache__/
+
+# ====================================================================
+# 7. Stray result files in root (canonical location: data/street_view/)
+# ====================================================================
+results/
