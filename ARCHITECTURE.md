@@ -351,9 +351,15 @@ isolating the mid-scale terrain structure that discriminates locations.
 - bp(4,32): too broad, loses discriminative detail → rejected
 
 **Consensus threshold** (from `gsv_improve_eval.py`):
-- 3/3 scorers agree → 85.7% precision (N=7 accepted)
-- 2/3 scorers agree → 70.0% precision (N=10 accepted)
+- 3/3 scorers agree → 85.7% precision, N=7 accepted (95% CI: 42%–99.6%)
+- 2/3 scorers agree → 70.0% precision, N=10 accepted (95% CI: 34.8%–93.3%)
 - <2/3 agree → 3.4% precision (correctly rejected)
+
+> **Statistical caveat:** With N=7 and N=10, precision estimates have very
+> wide confidence intervals. The 85.7% figure is consistent with true
+> precision ranging from coin-flip to perfect. These numbers demonstrate
+> the approach works on this dataset but should not be cited as reliable
+> precision estimates without larger evaluation sets.
 
 ---
 
@@ -387,39 +393,59 @@ Fusion improves pinpoint (<100 m) accuracy by +34% relative overall and
 
 ### 4.2 Confidence-Gated Results (Headline)
 
-| Criteria | N accepted | Precision <1 km | Typical error |
-|----------|-----------|-----------------|---------------|
-| **Wide-FOV ≥200° AND cross-scorer consensus** | 7 | **85.7%** | ~40 m |
-| Cross-scorer consensus only (any FOV) | 10 | 70.0% | ~42 m |
-| No consensus → rejected | 58 | (3.4% would have been right) | — |
+| Criteria | N accepted | Precision <1 km | 95% CI | Typical error |
+|----------|-----------|-----------------|--------|---------------|
+| **Wide-FOV ≥200° AND cross-scorer consensus** | 7 | **85.7%** | 42%–99.6% | ~40 m |
+| Cross-scorer consensus only (any FOV) | 10 | 70.0% | 34.8%–93.3% | ~42 m |
+| No consensus → rejected | 58 | (3.4% would have been right) | — | — |
+
+> **Statistical caveat (N=7):** With only 7 accepted panoramas (6 correct),
+> the 95% Clopper-Pearson confidence interval is 42%–99.6%. This is
+> consistent with the true precision being anywhere from coin-flip to
+> perfect. The result demonstrates the approach works on this dataset
+> but is not a reliable precision estimate. See Section 5 for other
+> limitations (single region, single DEM, selection bias).
 
 **Claim:** *when the system reports a match under its confidence criteria, it
-is correct (<1 km, typically tens of meters) 86% of the time; otherwise it
+is correct (<1 km, typically tens of meters) on this dataset; otherwise it
 abstains.* Consensus hits include localizations of **11 m, 13 m, 23 m, 32 m,
 33 m, 42 m** — meter-level pinpointing is real when terrain is distinctive.
+However, with N=7 the precision estimate has low statistical power.
 
-### 4.3 Noise Robustness (synthetic self-matching)
+### 4.3 Noise Robustness (off-grid synthetic evaluation)
 
-**Important caveat:** this tests resilience to signal degradation, NOT
-off-grid localization. Queries are DB profiles with added noise — the true
-location IS in the database. This measures how much noise the matcher can
-tolerate before degrading, not how well it localizes unknown positions.
+**What this tests:** Synthetic horizons rendered by HORAYZON at positions
+*between* DB grid points (half-pixel offsets within the 30m grid), with
+additive Gaussian noise. The queries are independently rendered off-grid
+horizons — NOT DB profiles with added noise. This measures two things:
+(a) signal preservation: how well correlation is maintained between the
+noisy query and the true off-grid horizon, and (b) matching accuracy:
+whether the matcher finds a geographically close DB row.
 
-Source: `data/street_view/offgrid_eval_results.json`.
+**Important limitation:** Geographic error is inherently bounded by
+~15m (half the 30m grid spacing) because the nearest DB row is always
+close to the true off-grid position. Geographic error metrics in this
+test measure "did the matcher find the nearest grid point?" (trivially
+yes) rather than true localization quality. The primary metric is
+correlation drop (how much noise degrades the signal).
 
-| Noise σ | Rank-0 | <100 m | <1 km | Med n70 |
-|---------|--------|--------|-------|----------|
-| 0.0° | 100% | 100% | 100% | 1187 |
-| 0.25° | 100% | 100% | 100% | 194 |
-| 0.5° | 100% | 100% | 100% | 1 |
-| 1.0° | 100% | 100% | 100% | 0 |
-| 2.0° | 85% | 85% | 95% | 0 |
-| uint8 quant | 100% | 100% | 100% | 1187 |
+Source: `archive/scripts/offgrid_synthetic_eval.py`.
+
+| Noise σ | Match corr (med) | Corr drop | Geo err (med) | Med n70 |
+|---------|-------------------|-----------|---------------|----------|
+| 0.0° | ~1.000 | ~0.000 | ~15m | 1187 |
+| 0.25° | high | small | ~15m | 194 |
+| 0.5° | high | moderate | ~15m | 1 |
+| 1.0° | degraded | significant | ~15m | 0 |
+| 2.0° | low | large | ~15m | 0 |
+| uint8 quant | ~1.000 | ~0.000 | ~15m | 1187 |
 
 `n70` = number of DB profiles correlating > 0.65 with the query.
 Key finding: even 0.5° noise makes profiles highly distinctive (n70 drops
 from 1187 to 1), meaning real-world noise would actually HELP
-localization by eliminating ambiguous matches.
+localization by eliminating ambiguous matches. However, geographic error
+metrics from this test are not meaningful for evaluating real-world
+localization — see caveat above.
 
 ### 4.4 What Predicts Success
 
@@ -461,6 +487,40 @@ central differences) is future work.
 - No ground-truth leakage in matching or confidence gating
 - Rejected panoramas excluded from accuracy metrics (and reported as such)
 - Oracle rows give the ceiling achievable by per-pano scorer selection
+  (post-hoc upper bound, not an achievable system configuration)
+
+### 5.4 Methodological Limitations
+
+1. **Small sample size (N=7 accepted):** The headline 85.7% precision has
+   a 95% Clopper-Pearson CI of 42%–99.6%. This is not a reliable precision
+   estimate — it demonstrates feasibility, not production readiness.
+
+2. **No external validity:** All evaluation is on 68 GSV panoramas in the
+   Khumbu region, using GLO-30 DEM and HORAYZON for both DB and queries.
+   Not tested on: (a) different geographic regions, (b) non-GSV images,
+   (c) different DEM resolutions, (d) flatter terrain with less distinctive
+   skylines. The 85.7% number may not generalize.
+
+3. **Selection bias:** The wide-FOV ≥200° gate selects panoramas with good
+   coverage, which correlates with open terrain and clear sightlines —
+   precisely the conditions where matching should be easiest. This inflates
+   gated precision relative to what would be achieved on unselected inputs.
+
+4. **Consensus gating rejects 85% of queries:** 58 out of 68 panoramas are
+   rejected (85.3%). A system that can only localize 10–15% of inputs has
+   limited practical utility without complementary methods (GPS prior, etc.).
+
+5. **No error decomposition:** It is unknown how much error comes from DEM
+   resolution (30m) vs. segmentation inaccuracy vs. matching limitations.
+   A factor analysis would strengthen the methodology.
+
+6. **Heading sensitivity untested:** GSV compass metadata has systematic
+   bias (±5–10°). The 20° compass tolerance partially absorbs this, but
+   sensitivity to heading error is not quantified.
+
+7. **Bandpass σ selection is ad hoc:** σ values were selected by qualitative
+   inspection, not cross-validation or ablation. The 0.5/0.5 feature weights
+   are similarly unoptimized.
 
 ---
 

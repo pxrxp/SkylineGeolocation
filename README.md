@@ -32,8 +32,14 @@ See `ARCHITECTURE.md` for full details, results, and verification.
 ## Headline Results
 
 - **85.7% precision at <1 km** on accepted panoramas (typically tens of meters)
-- **Noise robustness**: matcher tolerates up to 1.0° noise with no degradation
+  — but N=7 (95% CI: 42%–99.6%; see ARCHITECTURE.md §4.2 for caveats)
+- **Noise robustness**: correlation-based metrics show signal preservation
+  up to ~0.5° noise; geographic error metrics from the synthetic test are
+  bounded by grid spacing and not meaningful for real-world localization
 - **Zero impact** from uint8 quantization storage format
+
+> **All results are on 68 GSV panoramas in one region (Khumbu, Nepal)
+> with one DEM (GLO-30). External validity has not been established.**
 
 ## Quick Start
 
