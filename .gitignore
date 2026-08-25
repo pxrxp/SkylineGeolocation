@@ -3,29 +3,26 @@
 # ====================================================================
 data/geopose3k/
 data/digital_elevation_model/
-data/street_view/
-data/synthetic_dataset/
+data/street_view/gsv_crops/
+data/street_view/images/
+data/street_view/masks/
+data/street_view/panos/
 data/satellite_imagery/
 data/clouds/
-data/test_segmentation
 data/*.pth
 
-# Pipeline outputs, per-sample corr caches, DB backups
-data/eval/
-data/db_backup/
-
 # ====================================================================
-# 2. Third-party DB generator (built locally)
+# 2. Third-party (built locally)
 # ====================================================================
 HORAYZON/build/
 HORAYZON/dist/
 HORAYZON/
 
 # ====================================================================
-# 3. Pipeline temp outputs
+# 3. Regenerable caches and precomputed features
 # ====================================================================
-tmp/
-notebooks/*/output/
+data/street_view/db_val.npy
+data/street_view/db_d1.npy
 
 # ====================================================================
 # 4. IDE, Jupyter & OS metadata
@@ -49,16 +46,3 @@ env/
 *.log
 
 .env
-
-# ====================================================================
-# 6. Archive caches (scripts were temporary)
-# ====================================================================
-archive/scripts/__pycache__/
-archive/final/scripts/__pycache__/
-archive/final/src/__pycache__/
-archive/final/tests/__pycache__/
-
-# ====================================================================
-# 7. Stray result files in root (canonical location: data/street_view/)
-# ====================================================================
-results/
