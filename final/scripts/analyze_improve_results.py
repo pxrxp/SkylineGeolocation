@@ -12,7 +12,14 @@ import numpy as np
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-JSON_PATH = ROOT / "data" / "street_view" / "gsv_improve_eval_results.json"
+
+# Works from final/scripts (results copied alongside) OR from repo-root
+# scripts/ (reads data/street_view directly).
+_CANDIDATES = [
+    ROOT / "results" / "gsv_improve_eval_results.json",
+    ROOT / "data" / "street_view" / "gsv_improve_eval_results.json",
+]
+JSON_PATH = next((c for c in _CANDIDATES if c.exists()), _CANDIDATES[0])
 
 
 def stats(es):

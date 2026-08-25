@@ -28,17 +28,23 @@ from geopy.distance import geodesic
 from scipy.ndimage import gaussian_filter1d
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "scripts"))
+
+# Works from final/scripts (final/ bundle) OR from repo-root scripts/.
+# Resolve the repo root as the nearest ancestor containing data/street_view.
+_REPO = next((p for p in [ROOT, *ROOT.parents]
+              if (p / "data" / "street_view").exists()), ROOT)
+sys.path.insert(0, str(_REPO / "src"))
+sys.path.insert(0, str(_REPO / "scripts"))
 
 from horizon_format import decode_horizon_column
 from calibrate_and_eval_multiphoto import fuse_pano
 
-DB_PATH = ROOT / "notebooks" / "02_SkylineDatabase" / "output" / "skyline_db.parquet"
-GT_FILE = ROOT / "data" / "street_view" / "ground_truth.json"
-ANNOT_FILE = ROOT / "data" / "street_view" / "annotations.json"
-CROPS_DIR = ROOT / "data" / "street_view" / "gsv_crops"
-OUT_JSON = ROOT / "data" / "street_view" / "gsv_improve_eval_results.json"
+DATA_DIR = _REPO / "data" / "street_view"
+DB_PATH = _REPO / "notebooks" / "02_SkylineDatabase" / "output" / "skyline_db.parquet"
+GT_FILE = DATA_DIR / "ground_truth.json"
+ANNOT_FILE = DATA_DIR / "annotations.json"
+CROPS_DIR = DATA_DIR / "gsv_crops"
+OUT_JSON = DATA_DIR / "gsv_improve_eval_results.json"
 
 BIN_DEG = 0.5
 N_BINS = int(360 / BIN_DEG)

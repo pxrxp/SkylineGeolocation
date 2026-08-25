@@ -22,10 +22,14 @@ import pyarrow.parquet as pq
 from pathlib import Path
 from geopy.distance import geodesic
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# Resolve repo root from nearest ancestor containing data/street_view
+# (works both from final/scripts and repo-root scripts/).
+_here = Path(__file__).resolve()
+ROOT = next((p for p in [_here.parent.parent, *_here.parents]
+             if (p / "data" / "street_view").exists()),
+            _here.parent.parent)
+sys.path.insert(0, str(ROOT / "src"))
 from query_profile import extract_elevation_profile
-
-ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "notebooks" / "02_SkylineDatabase" / "output" / "skyline_db.parquet"
 GT_FILE = ROOT / "data" / "street_view" / "ground_truth.json"
 ANNOT_FILE = ROOT / "data" / "street_view" / "gsv_annotations.json"
