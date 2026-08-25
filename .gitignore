@@ -1,15 +1,7 @@
 # ====================================================================
-# 1. Heavy Datasets & GIS Data (~66 GB on disk, not in git)
+# 1. ALL data/ contents (large, copyrighted, or regenerable)
 # ====================================================================
-data/geopose3k/
-data/digital_elevation_model/
-data/street_view/gsv_crops/
-data/street_view/images/
-data/street_view/masks/
-data/street_view/panos/
-data/satellite_imagery/
-data/clouds/
-data/*.pth
+data/
 
 # ====================================================================
 # 2. Third-party (built locally)
@@ -19,10 +11,10 @@ HORAYZON/dist/
 HORAYZON/
 
 # ====================================================================
-# 3. Regenerable caches and precomputed features
+# 3. Archive caches
 # ====================================================================
-data/street_view/db_val.npy
-data/street_view/db_d1.npy
+archive/*/__pycache__/
+archive/*/*/__pycache__/
 
 # ====================================================================
 # 4. IDE, Jupyter & OS metadata
