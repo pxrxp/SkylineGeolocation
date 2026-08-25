@@ -28,7 +28,7 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter1d
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 IMAGES_DIR = os.path.join(ROOT, "data/street_view/images")
 CROPS_DIR = os.path.join(ROOT, "data/street_view/gsv_crops")
 MASKS_DIR = os.path.join(ROOT, "data/street_view/masks")
