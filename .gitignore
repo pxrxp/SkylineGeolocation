@@ -38,3 +38,15 @@ env/
 *.log
 
 .env
+
+# ====================================================================
+# 6. Large archive directories (datasets, backups, eval caches)
+# ====================================================================
+archive/dashboards/
+archive/data_db_backup/
+archive/data_eval/
+archive/results_archive/
+archive/synthetic_dataset/
+archive/synthetic_results/
+archive/test_segmentation/
+notebooks/*/output/

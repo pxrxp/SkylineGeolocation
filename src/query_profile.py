@@ -75,7 +75,7 @@ def extract_elevation_profile(
     fov_y_deg=65.0,
     aspect_ratio=None,
     r_tilt=None,
-    bin_deg=0.25,
+    bin_deg=0.5,
     min_boundary_coverage=0.5,
     column_keep_mask=None,
     azim_frame="camera",
@@ -351,8 +351,6 @@ def evaluate_skyline_quality(img, mask, profile, boundary_gradient_threshold=15.
 
     # --- Boundary edge strength (fog / haze detection) ---
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img.copy()
-
-    # Find the skg.copy()
 
     # Find the sky/terrain boundary pixel per column
     boundary_row = np.full(W, H, dtype=np.int32)

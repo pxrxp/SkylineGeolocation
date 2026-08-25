@@ -225,16 +225,25 @@ requiring manual annotation.
 - Loss: BCE + Dice combined loss (`bce_dice_loss`)
 - Metric: intersection-over-union (`compute_iou`)
 
-**Post-processing pipeline** (applied after raw U-Net inference):
+**U-Net output convention:**
+The sigmoid output is thresholded as `raw_mask = (prob <= threshold)`,
+producing **1 = sky, 0 = terrain**. The default refinement method
+(`lab_b_subpixel` / `refine_sky_mask_with_guidance`) correctly interprets
+this convention (`sky1 = (raw_unet_mask == 1)`). The other three methods
+(`grayscale_fixed`, `multichannel_fusion`, `dynamic_programming`) use the
+inverted convention (`sky1 = (raw_unet_mask == 0)`). Since `lab_b_subpixel`
+is the default and the only method validated end-to-end, this mismatch is
+harmless in practice — but those three methods should NOT be used without
+inverting the raw mask first.
+
+**Post-processing pipeline** (applied after raw U-Net inference, using `lab_b_subpixel`):
 1. Smart top-sky filtering with fallback for steep mountain crops
 2. Canny-guided barrier restricted to ±10 px window to block ground-snow
    bleed without cloud jumping
 3. CLAHE-enhanced multi-scale Canny + LAB b* channel sub-pixel fitting
    (`refine_sky_mask_with_guidance`)
-4. Multi-channel gradient fusion: weighted combination of LAB b*, HSV
-   saturation, and grayscale gradients (`refine_multichannel_gradient_fusion`)
-5. Strong 1D median + Gaussian smoothing to remove sawtooth jitter
-6. Quality gates: min sky ratio (0.05), max sky ratio (0.95), boundary
+4. Strong 1D median + Gaussian smoothing to remove sawtooth jitter
+5. Quality gates: min sky ratio (0.05), max sky ratio (0.95), boundary
    coverage threshold
 
 ### 3.6 Query Profile Extraction

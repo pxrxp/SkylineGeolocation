@@ -99,47 +99,11 @@ def saliency_weights(profile, alpha=2.0):
     return 1.0 + alpha * kappa
 
 
-def fit_affine_scale_offset(db_horizon, profile, offset_bin):
-    """Least-squares affine fit profile ≈ A·db + b at the aligned offset.
-
-    Parameters
-    ----------
-    db_horizon : (L,) float — DB elevation-angle horizon.
-    profile : (M,) float — query elevation-angle profile.
-    offset_bin : int — circular DB-bin offset aligning profile to db_horizon.
-
-    Returns
-    -------
-    (A, b, rmse) — vertical scale, vertical offset, fit residual (deg).
-    """
-    db_horizon = np.asarray(db_horizon, dtype=np.float64)
-    profile = np.asarray(profile, dtype=np.float64)
-    L = len(db_horizon)
-    M = len(profile)
-    if M == 0 or L == 0:
-        return 0.0, 0.0, float("inf")
-
-    idx = (np.arange(M) + offset_bin) % L
-    db_a = db_horizon[idx]
-    dbm = db_a - db_a.mean()
-    pm = profile - profile.mean()
-    var = np.dot(dbm, dbm)
-    if var < 1e-12:
-        return 0.0, float(profile.mean()), float(np.std(profile))
-    A = float(np.dot(dbm, pm) / var)
-    b = float(profile.mean() - A * db_a.mean())
-    resid = profile - (A * db_a + b)
-    rmse = float(np.sqrt(np.mean(resid**2)))
-    return A, b, rmse
-
-
-AFFINE_SCALE_RANGE = (0.6, 1.6)
-
-
-def affine_scale_ok(A):
-    """True if vertical scale A is physically plausible."""
-    return AFFINE_SCALE_RANGE[0] <= A <= AFFINE_SCALE_RANGE[1]
-
+# NOTE: saliency weighting and affine-scale fitting were tested and
+# rejected — saliency weighting hurts precision (HISTORICAL_WORKLOG.md),
+# affine-scale residual ranking rewards smooth non-distinctive horizons.
+# saliency_weights + _pearson_ncc_weighted_batch are retained behind the
+# saliency_alpha>0 gate for potential future experiments.
 
 def _pearson_ncc_weighted_batch(db_ext, query_zm, q_norm, weights):
     """Weighted Pearson NCC: Σ(w·q·db) / sqrt(Σ(w·q²)·Σ(w·db²)).
@@ -220,9 +184,19 @@ def _pearson_ncc_batch(db_ext, query_zm, q_norm):
     -------
     ncc : (N, L) float64
         Pearson correlation at every offset.
+
+    Raises
+    ------
+    ValueError
+        If db_ext rows are shorter than query_zm.
     """
     N, ext_len = db_ext.shape
     M = len(query_zm)
+    if ext_len < M:
+        raise ValueError(
+            f"db_ext length ({ext_len}) must be >= query length ({M}) + L - 1; "
+            f"got db_ext shape {db_ext.shape} vs query shape ({M},)"
+        )
     L = ext_len - M + 1
 
     # Numerator via FFT-based circular cross-correlation (O(L log L) per row)

@@ -13,11 +13,11 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "scripts"))
 
 from horizon_format import (encode_horizon_uint8, decode_horizon_uint8,
                             DEG_PER_BIN)
 from matching import feature_bundle_matrix, ncc_scores, fft_prefilter
+from rrf_helpers import ScorerState, rrf_top1
 
 PASS, FAIL = [], []
 
@@ -164,11 +164,10 @@ def test_query_shorter_than_db():
 
 
 def test_rrf_fusion():
-    print("gsv_improve_eval RRF fusion:")
-    import gsv_improve_eval as G
+    print("RRF fusion:")
 
     def mk(heap_items):
-        st = G.ScorerState()
+        st = ScorerState()
         st.heap = list(heap_items)
         return st
 
@@ -179,13 +178,13 @@ def test_rrf_fusion():
         "bp28":     mk([(0.85, 300, 0, 0), (0.7, 102, 0, 0), consensus]),
         "bp316":    mk([(0.83, 400, 0, 0), (0.7, 103, 0, 0), consensus]),
     }
-    (lat, lon), votes, scores = G.rrf_top1(states)
+    (lat, lon), votes, scores = rrf_top1(states)
     check("RRF winner is the cross-scorer consensus row", lat == 27.5,
           f"winner={lat},{lon} votes={votes}")
     check("all three scorers vote for the winner", votes == 3, f"votes={votes}")
 
     empty = {k: mk([]) for k in ("baseline", "bp28", "bp316")}
-    res = G.rrf_top1(empty)
+    res = rrf_top1(empty)
     check("empty heaps -> no match, not a crash", res[0] is None)
 
 
