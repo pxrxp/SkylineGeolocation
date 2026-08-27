@@ -17,6 +17,8 @@ Usage:
 import sys
 import json
 import time
+import hashlib
+import pickle
 import heapq
 import argparse
 import tempfile
@@ -44,12 +46,38 @@ ANNOT_FILE = ROOT / "data" / "street_view" / "annotations.json"
 CROPS_DIR = ROOT / "data" / "street_view" / "gsv_crops"
 OUT_JSON = ROOT / "data" / "street_view" / "end_to_end_results.json"
 MODEL_PATH = ROOT / "data" / "sky_segmentation_unet_model.pth"
+CKPT_DIR = ROOT / "data" / "eval_ckpt"
 
 BIN_DEG = 0.5
 N_BINS = int(360 / BIN_DEG)
 CHUNK = 8000
 TOP_KEEP = 50
 W, H = 1080, 720
+
+
+def _ckpt(phase, extra=""):
+    """Return checkpoint path for a given phase. extra tags different stride/device combos."""
+    tag = hashlib.md5(extra.encode()).hexdigest()[:8] if extra else "default"
+    p = CKPT_DIR / f"e2e_p{phase}_{tag}.pkl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _save_ckpt(path, data):
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.rename(path)
+    mb = path.stat().st_size / (1024 * 1024)
+    print(f"  [CKPT] Saved ({mb:.1f}MB): {path.name}")
+
+
+def _load_ckpt(path):
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    mb = path.stat().st_size / (1024 * 1024)
+    print(f"  [RESUME] Loaded ({mb:.1f}MB): {path.name}")
+    return data
 
 
 # ── Scoring helpers (from gsv_improve_eval.py) ────────────────────────────
@@ -254,6 +282,10 @@ def main():
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--max-panos", type=int, default=None,
                     help="Limit number of panos (for quick testing)")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from checkpoints if available (skip completed phases)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="Ignore all checkpoints, run from scratch")
     args = ap.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -276,7 +308,10 @@ def main():
     # ── Group crops by pano ────────────────────────────────────────────────
     panos = {}  # pano_id -> list of {sid, heading_deg, fov_y_deg, has_annot}
     for crop_json in sorted(CROPS_DIR.glob("*.json")):
-        meta = json.loads(crop_json.read_text())
+        raw = json.loads(crop_json.read_text())
+        if not isinstance(raw, dict):
+            continue
+        meta = raw
         pid = meta.get("pano_id")
         if not pid:
             continue
@@ -292,96 +327,117 @@ def main():
         keys = sorted(multi.keys())[:args.max_panos]
         multi = {k: multi[k] for k in keys}
 
+    ckpt_tag = f"s{args.stride}_{device}_{len(multi)}"
+    ck1 = _ckpt(1, ckpt_tag)
+    ck2 = _ckpt(2, ckpt_tag)
+
     print(f"Found {len(multi)} multi-crop panoramas to evaluate\n")
 
     # ── Phase 1: Segmentation + profile extraction ─────────────────────────
-    print("=" * 76)
-    print("PHASE 1: Segmentation + profile extraction")
-    print("=" * 76)
-
-    pano_data = {}  # pid -> {auto_profiles, annot_profiles, seg_stats}
-    t0 = time.time()
-
-    for idx, (pid, crops) in enumerate(sorted(multi.items())):
-        gt_entry = gt_data.get(pid, {})
-
-        # Auto path: U-Net on each crop
-        auto_profiles = []
-        seg_stats = []
-        for c in crops:
-            img_path = CROPS_DIR / c["filename"]
-            if not img_path.exists():
-                auto_profiles.append((c["heading_deg"], None, c.get("fov_y_deg", 65.0)))
-                continue
-            prof, cov, diag = auto_segment_and_profile(
-                model, img_path, c.get("fov_y_deg", 65.0),
-                c["heading_deg"], gt_entry, device,
-            )
-            auto_profiles.append((c["heading_deg"], prof, c.get("fov_y_deg", 65.0)))
-            seg_stats.append(diag)
-
-        # Annotation path (only for crops with annotations)
-        annot_crops = [c for c in crops if c.get("has_annot")]
-        annot_profiles_list = annot_crops  # fuse_pano expects crop dicts with 'points'
-        annot_fused, annot_cov = None, 0.0
-        if annot_crops:
-            annot_fused, annot_cov = fuse_pano(annot_crops, gt_data, bin_deg=BIN_DEG)
-
-        # Fuse auto profiles
-        auto_fused, auto_cov, n_used = fuse_pano_auto(auto_profiles, gt_data)
-
-        # Quality checks for auto path
-        auto_valid = False
-        auto_quality_reason = ""
-        if auto_fused is not None:
-            ok, reason = is_profile_applicable(auto_fused)
-            if ok and auto_cov >= 180:
-                auto_valid = True
+    pano_data = None
+    if args.resume and ck1.exists() and not args.fresh:
+        try:
+            ck1_data = _load_ckpt(ck1)
+            pano_data = ck1_data["pano_data"]
+            multi_keys = set(ck1_data.get("multi_keys", []))
+            if set(multi.keys()) == multi_keys:
+                print("  [RESUME] Phase 1 fully cached — skipping segmentation")
             else:
-                auto_quality_reason = reason if not ok else f"cov={auto_cov:.0f}°<180°"
-        else:
-            auto_quality_reason = "fuse failed"
+                print(f"  [RESUME] Phase 1 cache has {len(multi_keys)} panos, current has {len(multi)} — re-running")
+                pano_data = None
+        except Exception as e:
+            print(f"  [RESUME] Phase 1 cache corrupt ({e}) — re-running")
+            pano_data = None
 
-        annot_valid = False
-        annot_quality_reason = ""
-        if annot_fused is not None:
-            ok, reason = is_profile_applicable(annot_fused)
-            if ok and annot_cov >= 180:
-                annot_valid = True
+    if pano_data is None:
+        print("=" * 76)
+        print("PHASE 1: Segmentation + profile extraction")
+        print("=" * 76)
+
+        pano_data = {}  # pid -> {auto_profiles, annot_profiles, seg_stats}
+        t0 = time.time()
+
+        for idx, (pid, crops) in enumerate(sorted(multi.items())):
+            gt_entry = gt_data.get(pid, {})
+
+            # Auto path: U-Net on each crop
+            auto_profiles = []
+            seg_stats = []
+            for c in crops:
+                img_path = CROPS_DIR / c["filename"]
+                if not img_path.exists():
+                    auto_profiles.append((c["heading_deg"], None, c.get("fov_y_deg", 65.0)))
+                    continue
+                prof, cov, diag = auto_segment_and_profile(
+                    model, img_path, c.get("fov_y_deg", 65.0),
+                    c["heading_deg"], gt_entry, device,
+                )
+                auto_profiles.append((c["heading_deg"], prof, c.get("fov_y_deg", 65.0)))
+                seg_stats.append(diag)
+
+            # Annotation path (only for crops with annotations)
+            annot_crops = [c for c in crops if c.get("has_annot")]
+            annot_profiles_list = annot_crops  # fuse_pano expects crop dicts with 'points'
+            annot_fused, annot_cov = None, 0.0
+            if annot_crops:
+                annot_fused, annot_cov = fuse_pano(annot_crops, gt_data, bin_deg=BIN_DEG)
+
+            # Fuse auto profiles
+            auto_fused, auto_cov, n_used = fuse_pano_auto(auto_profiles, gt_data)
+
+            # Quality checks for auto path
+            auto_valid = False
+            auto_quality_reason = ""
+            if auto_fused is not None:
+                ok, reason = is_profile_applicable(auto_fused)
+                if ok and auto_cov >= 180:
+                    auto_valid = True
+                else:
+                    auto_quality_reason = reason if not ok else f"cov={auto_cov:.0f}°<180°"
             else:
-                annot_quality_reason = reason if not ok else f"cov={annot_cov:.0f}°<180°"
-        else:
-            annot_quality_reason = "no annotations or fuse failed"
+                auto_quality_reason = "fuse failed"
 
-        # Segmentation quality summary for this pano
-        sky_ratios = [d.get("sky_ratio", 0) for d in seg_stats if d]
-        mean_sky = float(np.mean(sky_ratios)) if sky_ratios else 0
-        mean_conf = float(np.mean([d.get("mean_confidence", 0) for d in seg_stats if d.get("mean_confidence") is not None])) if seg_stats else 0
-        top_connected = sum(1 for d in seg_stats if d.get("top_connected", False))
+            annot_valid = False
+            annot_quality_reason = ""
+            if annot_fused is not None:
+                ok, reason = is_profile_applicable(annot_fused)
+                if ok and annot_cov >= 180:
+                    annot_valid = True
+                else:
+                    annot_quality_reason = reason if not ok else f"cov={annot_cov:.0f}°<180°"
+            else:
+                annot_quality_reason = "no annotations or fuse failed"
 
-        pano_data[pid] = {
-            "auto_fused": auto_fused,
-            "auto_cov": auto_cov,
-            "auto_valid": auto_valid,
-            "auto_quality_reason": auto_quality_reason,
-            "annot_fused": annot_fused,
-            "annot_cov": annot_cov,
-            "annot_valid": annot_valid,
-            "annot_quality_reason": annot_quality_reason,
-            "n_crops": len(crops),
-            "n_annot": len(annot_crops),
-            "mean_sky_ratio": mean_sky,
-            "mean_seg_confidence": mean_conf,
-            "top_connected_crops": top_connected,
-            "n_seg_crops": len(seg_stats),
-        }
+            # Segmentation quality summary for this pano
+            sky_ratios = [d.get("sky_ratio", 0) for d in seg_stats if d]
+            mean_sky = float(np.mean(sky_ratios)) if sky_ratios else 0
+            mean_conf = float(np.mean([d.get("mean_confidence", 0) for d in seg_stats if d.get("mean_confidence") is not None])) if seg_stats else 0
+            top_connected = sum(1 for d in seg_stats if d.get("top_connected", False))
 
-        if (idx + 1) % 10 == 0:
-            elapsed = time.time() - t0
-            eta = elapsed / (idx + 1) * (len(multi) - idx - 1)
-            print(f"  [{idx + 1}/{len(multi)}] {elapsed:.0f}s elapsed, ~{eta:.0f}s left")
+            pano_data[pid] = {
+                "auto_fused": auto_fused,
+                "auto_cov": auto_cov,
+                "auto_valid": auto_valid,
+                "auto_quality_reason": auto_quality_reason,
+                "annot_fused": annot_fused,
+                "annot_cov": annot_cov,
+                "annot_valid": annot_valid,
+                "annot_quality_reason": annot_quality_reason,
+                "n_crops": len(crops),
+                "n_annot": len(annot_crops),
+                "mean_sky_ratio": mean_sky,
+                "mean_seg_confidence": mean_conf,
+                "top_connected_crops": top_connected,
+                "n_seg_crops": len(seg_stats),
+            }
 
-    print(f"\nPhase 1 done: {time.time() - t0:.0f}s\n")
+            if (idx + 1) % 10 == 0:
+                elapsed = time.time() - t0
+                eta = elapsed / (idx + 1) * (len(multi) - idx - 1)
+                print(f"  [{idx + 1}/{len(multi)}] {elapsed:.0f}s elapsed, ~{eta:.0f}s left")
+
+        print(f"\nPhase 1 done: {time.time() - t0:.0f}s\n")
+        _save_ckpt(ck1, {"pano_data": pano_data, "multi_keys": list(multi.keys())})
 
     # ── Summary of segmentation quality ────────────────────────────────────
     all_sky = [d["mean_sky_ratio"] for d in pano_data.values() if d["n_seg_crops"] > 0]
@@ -401,98 +457,112 @@ def main():
     print(f"  Annot profiles valid (≥180°): {annot_valid_n}/{len(multi)}")
 
     # ── Phase 2: DB matching ───────────────────────────────────────────────
-    print("\n" + "=" * 76)
-    print("PHASE 2: Database matching (streaming)")
-    print("=" * 76)
+    auto_prepared = None
+    if args.resume and ck2.exists() and not args.fresh:
+        try:
+            ck2_data = _load_ckpt(ck2)
+            auto_prepared = ck2_data["auto_prepared"]
+            annot_prepared = ck2_data["annot_prepared"]
+            truth = ck2_data["truth"]
+            print(f"  [RESUME] Phase 2 cached ({len(auto_prepared)} auto, {len(annot_prepared)} annot) \u2014 skipping DB scan")
+        except Exception as e:
+            print(f"  [RESUME] Phase 2 cache corrupt ({e}) \u2014 re-running")
+            auto_prepared = None
 
-    # Build scorer states for valid auto profiles
-    auto_prepared = {}
-    annot_prepared = {}
+    if auto_prepared is None:
+        print("\n" + "=" * 76)
+        print("PHASE 2: Database matching (streaming)")
+        print("=" * 76)
 
-    for pid, d in pano_data.items():
-        if d["auto_valid"] and d["auto_fused"] is not None:
-            auto_prepared[pid] = {"states": build_states(d["auto_fused"])}
-        if d["annot_valid"] and d["annot_fused"] is not None:
-            annot_prepared[pid] = {"states": build_states(d["annot_fused"])}
+        # Build scorer states for valid auto profiles
+        auto_prepared = {}
+        annot_prepared = {}
 
-    print(f"  Auto panos to match:  {len(auto_prepared)}")
-    print(f"  Annot panos to match: {len(annot_prepared)}")
+        for pid, d in pano_data.items():
+            if d["auto_valid"] and d["auto_fused"] is not None:
+                auto_prepared[pid] = {"states": build_states(d["auto_fused"])}
+            if d["annot_valid"] and d["annot_fused"] is not None:
+                annot_prepared[pid] = {"states": build_states(d["annot_fused"])}
 
-    # Resolve true VP rows
-    truth = {}
-    for pid in set(auto_prepared) | set(annot_prepared):
-        g = gt_data.get(pid) or {}
-        la = g.get("true_lat") or g.get("lat")
-        lo = g.get("true_lon") or g.get("lon")
-        if la is not None:
-            truth[pid] = (la, lo)
+        print(f"  Auto panos to match:  {len(auto_prepared)}")
+        print(f"  Annot panos to match: {len(annot_prepared)}")
 
-    try:
-        from scipy.spatial import cKDTree
+        # Resolve true VP rows
+        truth = {}
+        for pid in set(auto_prepared) | set(annot_prepared):
+            g = gt_data.get(pid) or {}
+            la = g.get("true_lat") or g.get("lat")
+            lo = g.get("true_lon") or g.get("lon")
+            if la is not None:
+                truth[pid] = (la, lo)
+
+        try:
+            from scipy.spatial import cKDTree
+            pf = pq.ParquetFile(str(DB_PATH))
+            las, los = [], []
+            for b in pf.iter_batches(batch_size=50000, columns=["lat", "lon"]):
+                df = b.to_pandas()
+                las.append(df["lat"].to_numpy())
+                los.append(df["lon"].to_numpy())
+            db_lat, db_lon = np.concatenate(las), np.concatenate(los)
+            mcos = np.cos(np.deg2rad(db_lat.mean()))
+            tree = cKDTree(np.column_stack([db_lon * mcos, db_lat]))
+            for pid in truth:
+                la, lo = truth[pid]
+                d, idx = tree.query([lo * mcos, la], k=1)
+                if d * 111_320 < 250:
+                    for prep in (auto_prepared, annot_prepared):
+                        if pid in prep:
+                            prep[pid]["true_row"] = int(idx)
+                else:
+                    for prep in (auto_prepared, annot_prepared):
+                        if pid in prep:
+                            prep[pid]["true_row"] = None
+            del db_lat, db_lon, tree
+        except Exception as e:
+            print(f"  KDTree failed ({e}); ranks skipped")
+            for prep in (auto_prepared, annot_prepared):
+                for pid in prep:
+                    prep[pid]["true_row"] = None
+
+        # Streaming DB scan
+        all_pids = list(set(auto_prepared) | set(annot_prepared))
+        all_states = [auto_prepared[p]["states"] for p in all_pids if p in auto_prepared]
+        all_states += [annot_prepared[p]["states"] for p in all_pids if p in annot_prepared]
+        # Deduplicate states that appear in both (same pano)
+        seen_states = set()
+        unique_states = []
+        for s in all_states:
+            sid = id(s)
+            if sid not in seen_states:
+                seen_states.add(sid)
+                unique_states.append(s)
+
         pf = pq.ParquetFile(str(DB_PATH))
-        las, los = [], []
-        for b in pf.iter_batches(batch_size=50000, columns=["lat", "lon"]):
-            df = b.to_pandas()
-            las.append(df["lat"].to_numpy())
-            los.append(df["lon"].to_numpy())
-        db_lat, db_lon = np.concatenate(las), np.concatenate(los)
-        mcos = np.cos(np.deg2rad(db_lat.mean()))
-        tree = cKDTree(np.column_stack([db_lon * mcos, db_lat]))
-        for pid in truth:
-            la, lo = truth[pid]
-            d, idx = tree.query([lo * mcos, la], k=1)
-            if d * 111_320 < 250:
-                for prep in (auto_prepared, annot_prepared):
-                    if pid in prep:
-                        prep[pid]["true_row"] = int(idx)
-            else:
-                for prep in (auto_prepared, annot_prepared):
-                    if pid in prep:
-                        prep[pid]["true_row"] = None
-        del db_lat, db_lon, tree
-    except Exception as e:
-        print(f"  KDTree failed ({e}); ranks skipped")
-        for prep in (auto_prepared, annot_prepared):
-            for pid in prep:
-                prep[pid]["true_row"] = None
+        total_chunks = (pf.metadata.num_rows + CHUNK - 1) // CHUNK
+        t0 = time.time()
+        pos = done = 0
 
-    # Streaming DB scan
-    all_pids = list(set(auto_prepared) | set(annot_prepared))
-    all_states = [auto_prepared[p]["states"] for p in all_pids if p in auto_prepared]
-    all_states += [annot_prepared[p]["states"] for p in all_pids if p in annot_prepared]
-    # Deduplicate states that appear in both (same pano)
-    seen_states = set()
-    unique_states = []
-    for s in all_states:
-        sid = id(s)
-        if sid not in seen_states:
-            seen_states.add(sid)
-            unique_states.append(s)
+        for batch in pf.iter_batches(batch_size=CHUNK,
+                                     columns=["raw_horizon_deg", "lat", "lon"]):
+            df = batch.to_pandas()
+            n = len(df)
+            sel = slice(None) if args.stride == 1 else slice(None, None, args.stride)
+            Hc = decode_horizon_column(df["raw_horizon_deg"].to_numpy())[sel]
+            lats = df["lat"].to_numpy()[sel]
+            lons = df["lon"].to_numpy()[sel]
+            del df, batch
+            score_chunk(unique_states, Hc, lats, lons, pos)
+            pos += n
+            done += 1
+            if done % 25 == 0 or done == total_chunks:
+                el = time.time() - t0
+                eta = el / done * (total_chunks - done)
+                print(f"  chunk {done}/{total_chunks}  {el:.0f}s elapsed, "
+                      f"~{eta:.0f}s left", flush=True)
 
-    pf = pq.ParquetFile(str(DB_PATH))
-    total_chunks = (pf.metadata.num_rows + CHUNK - 1) // CHUNK
-    t0 = time.time()
-    pos = done = 0
-
-    for batch in pf.iter_batches(batch_size=CHUNK,
-                                 columns=["raw_horizon_deg", "lat", "lon"]):
-        df = batch.to_pandas()
-        n = len(df)
-        sel = slice(None) if args.stride == 1 else slice(None, None, args.stride)
-        Hc = decode_horizon_column(df["raw_horizon_deg"].to_numpy())[sel]
-        lats = df["lat"].to_numpy()[sel]
-        lons = df["lon"].to_numpy()[sel]
-        del df, batch
-        score_chunk(unique_states, Hc, lats, lons, pos)
-        pos += n
-        done += 1
-        if done % 25 == 0 or done == total_chunks:
-            el = time.time() - t0
-            eta = el / done * (total_chunks - done)
-            print(f"  chunk {done}/{total_chunks}  {el:.0f}s elapsed, "
-                  f"~{eta:.0f}s left", flush=True)
-
-    print(f"\nPhase 2 done: {time.time() - t0:.0f}s\n")
+        print(f"\nPhase 2 done: {time.time() - t0:.0f}s\n")
+        _save_ckpt(ck2, {"auto_prepared": auto_prepared, "annot_prepared": annot_prepared, "truth": truth})
 
     # ── Phase 3: Evaluate ──────────────────────────────────────────────────
     print("=" * 76)
@@ -526,9 +596,14 @@ def main():
                     ranked = sorted(sts[name].heap, key=lambda x: -x[0])
                     auto_ranks[name] = next(
                         (r for r, e in enumerate(ranked) if e[1] == tr), TOP_KEEP)
-            rlat, rlon, rrf_score, _ = rrf_top1(sts)
-            auto_errs["rrf"] = (geodesic((tl, lo_), (rlat, rlon)).meters
-                                if rlat and tl else float("inf"))
+            _rrf_res = rrf_top1(sts)
+            _rrf_ll = _rrf_res[0]
+            if _rrf_ll is not None:
+                rlat, rlon = _rrf_ll
+                auto_errs["rrf"] = (geodesic((tl, lo_), (rlat, rlon)).meters
+                                    if tl is not None else float("inf"))
+            else:
+                auto_errs["rrf"] = float("inf")
         else:
             for name in BASE_SCORERS:
                 auto_errs[name] = float("inf")
@@ -549,9 +624,14 @@ def main():
                     ranked = sorted(sts[name].heap, key=lambda x: -x[0])
                     annot_ranks[name] = next(
                         (r for r, e in enumerate(ranked) if e[1] == tr), TOP_KEEP)
-            rlat, rlon, rrf_score, _ = rrf_top1(sts)
-            annot_errs["rrf"] = (geodesic((tl, lo_), (rlat, rlon)).meters
-                                 if rlat and tl else float("inf"))
+            _rrf_res = rrf_top1(sts)
+            _rrf_ll = _rrf_res[0]
+            if _rrf_ll is not None:
+                rlat, rlon = _rrf_ll
+                annot_errs["rrf"] = (geodesic((tl, lo_), (rlat, rlon)).meters
+                                     if tl is not None else float("inf"))
+            else:
+                annot_errs["rrf"] = float("inf")
         else:
             for name in BASE_SCORERS:
                 annot_errs[name] = float("inf")

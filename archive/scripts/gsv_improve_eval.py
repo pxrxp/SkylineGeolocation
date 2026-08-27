@@ -19,6 +19,8 @@ Usage:
 import sys
 import json
 import time
+import hashlib
+import pickle
 import heapq
 import argparse
 import numpy as np
@@ -39,6 +41,7 @@ GT_FILE = ROOT / "data" / "street_view" / "ground_truth.json"
 ANNOT_FILE = ROOT / "data" / "street_view" / "annotations.json"
 CROPS_DIR = ROOT / "data" / "street_view" / "gsv_crops"
 OUT_JSON = ROOT / "data" / "street_view" / "gsv_improve_eval_results.json"
+CKPT_DIR = ROOT / "data" / "eval_ckpt"
 
 BIN_DEG = 0.5
 N_BINS = int(360 / BIN_DEG)
@@ -46,6 +49,29 @@ CHUNK = 8000
 TOP_KEEP = 50
 
 BASE_SCORERS = ["baseline", "bp28", "bp316"]
+
+
+def _ckpt(extra=""):
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    tag = hashlib.md5(extra.encode()).hexdigest()[:8] if extra else "default"
+    return CKPT_DIR / f"gsv_improve_p2_{tag}.pkl"
+
+
+def _save_ckpt(path, data):
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.rename(path)
+    mb = path.stat().st_size / (1024 * 1024)
+    print(f"  [CKPT] Saved ({mb:.1f}MB): {path.name}")
+
+
+def _load_ckpt(path):
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    mb = path.stat().st_size / (1024 * 1024)
+    print(f"  [RESUME] Loaded ({mb:.1f}MB): {path.name}")
+    return data
 
 
 def zr(m):
@@ -183,6 +209,10 @@ def rrf_top1(sts, k=60):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stride", type=int, default=2)
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from checkpoints if available")
+    ap.add_argument("--fresh", action="store_true",
+                    help="Ignore all checkpoints, run from scratch")
     args = ap.parse_args()
     stride = args.stride
 
@@ -251,31 +281,46 @@ def main():
         for pid in pano_ids:
             prepared[pid]["true_row"] = None
 
-    # --- streaming pass ---
-    pf = pq.ParquetFile(str(DB_PATH))
-    total_chunks = (pf.metadata.num_rows + CHUNK - 1) // CHUNK
-    states_list = [prepared[p]["states"] for p in pano_ids]
-    t0 = time.time()
-    pos = done = 0
+    # --- streaming pass (with checkpoint) ---
+    ck = _ckpt(f"s{stride}_{len(pano_ids)}")
+    db_scanned = False
+    if args.resume and ck.exists() and not args.fresh:
+        try:
+            ck_data = _load_ckpt(ck)
+            prepared = ck_data["prepared"]
+            truth = ck_data["truth"]
+            pano_ids = ck_data["pano_ids"]
+            print(f"  [RESUME] DB scan cached ({len(pano_ids)} panos) \u2014 skipping")
+            db_scanned = True
+        except Exception as e:
+            print(f"  [RESUME] Cache corrupt ({e}) \u2014 re-running")
 
-    for batch in pf.iter_batches(batch_size=CHUNK,
-                                 columns=["raw_horizon_deg", "lat", "lon"]):
-        df = batch.to_pandas()
-        n = len(df)
-        sel = slice(None) if stride == 1 else slice(None, None, stride)
-        Hc = decode_horizon_column(df["raw_horizon_deg"].to_numpy())[sel]
-        lats = df["lat"].to_numpy()[sel]
-        lons = df["lon"].to_numpy()[sel]
-        del df, batch
+    if not db_scanned:
+        pf = pq.ParquetFile(str(DB_PATH))
+        total_chunks = (pf.metadata.num_rows + CHUNK - 1) // CHUNK
+        states_list = [prepared[p]["states"] for p in pano_ids]
+        t0 = time.time()
+        pos = done = 0
 
-        score_chunk(states_list, Hc, lats, lons, pos)
-        pos += n
-        done += 1
-        if done % 25 == 0 or done == total_chunks:
-            el = time.time() - t0
-            eta = el / done * (total_chunks - done)
-            print(f"  chunk {done}/{total_chunks}  {el:.0f}s elapsed, "
-                  f"~{eta:.0f}s left", flush=True)
+        for batch in pf.iter_batches(batch_size=CHUNK,
+                                     columns=["raw_horizon_deg", "lat", "lon"]):
+            df = batch.to_pandas()
+            n = len(df)
+            sel = slice(None) if stride == 1 else slice(None, None, stride)
+            Hc = decode_horizon_column(df["raw_horizon_deg"].to_numpy())[sel]
+            lats = df["lat"].to_numpy()[sel]
+            lons = df["lon"].to_numpy()[sel]
+            del df, batch
+
+            score_chunk(states_list, Hc, lats, lons, pos)
+            pos += n
+            done += 1
+            if done % 25 == 0 or done == total_chunks:
+                el = time.time() - t0
+                eta = el / done * (total_chunks - done)
+                print(f"  chunk {done}/{total_chunks}  {el:.0f}s elapsed, "
+                      f"~{eta:.0f}s left", flush=True)
+        _save_ckpt(ck, {"prepared": prepared, "truth": truth, "pano_ids": pano_ids})
 
     # --- evaluate ---
     print("\nEvaluating...\n")

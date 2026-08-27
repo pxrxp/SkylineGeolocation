@@ -17,6 +17,9 @@ import json
 import os
 import sys
 import time
+import hashlib
+import pickle
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +42,30 @@ OUT_JSON = ROOT / "data" / "street_view" / "consensus_eval_results.json"
 W, H = 1080, 720
 STRIDE = 12
 TOP_N = 600  # keep 600 candidates (margin above 500)
+CKPT_DIR = ROOT / "data" / "eval_ckpt"
+
+
+def _ckpt(extra=""):
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    tag = hashlib.md5(extra.encode()).hexdigest()[:8] if extra else "default"
+    return CKPT_DIR / f"consensus_p1_{tag}.pkl"
+
+
+def _save_ckpt(path, data):
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.rename(path)
+    mb = path.stat().st_size / (1024 * 1024)
+    print(f"  [CKPT] Saved ({mb:.1f}MB): {path.name}")
+
+
+def _load_ckpt(path):
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    mb = path.stat().st_size / (1024 * 1024)
+    print(f"  [RESUME] Loaded ({mb:.1f}MB): {path.name}")
+    return data
 
 
 def mask_from_points(points):
@@ -298,6 +325,13 @@ def consensus_rerank_all(crop_queries, db_horizons, fusion_corrs, n_bins):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from checkpoints if available")
+    ap.add_argument("--fresh", action="store_true",
+                    help="Ignore all checkpoints, run from scratch")
+    args = ap.parse_args()
+
     print("=" * 70)
     print("Multi-Photo Consensus Re-Ranking Evaluator (single-pass)")
     print("=" * 70)
@@ -341,7 +375,20 @@ def main():
     print(f"Found {len(multi_panos)} multi-crop panoramas")
 
     results = []
+    ck = _ckpt(f"{len(multi_panos)}")
+    if args.resume and ck.exists() and not args.fresh:
+        try:
+            ck_data = _load_ckpt(ck)
+            results = ck_data["results"]
+            print(f"  [RESUME] Results cached ({len(results)} panos) \u2014 skipping DB scan")
+        except Exception as e:
+            print(f"  [RESUME] Cache corrupt ({e}) \u2014 re-running")
+            results = []
+
+    done_panos = {r["pano_id"] for r in results}
     for pid, crops in multi_panos.items():
+        if pid in done_panos:
+            continue
         t_pano = time.time()
         sid0 = crops[0]["sid"]
         gt_entry = gt_data.get(sid0) or gt_data.get(pid) or {}
@@ -418,6 +465,8 @@ def main():
             r[f"{vname}_err_m"] = float(v_err)
             r[f"{vname}_details"] = v_details
         results.append(r)
+        # Save checkpoint incrementally (in case of crash)
+        _save_ckpt(ck, {"results": results})
 
         elapsed = time.time() - t_pano
         base_s = f"{baseline_err:8.0f}m"

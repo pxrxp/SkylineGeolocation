@@ -16,6 +16,8 @@ Confidence gates (unchanged from V3/V4):
 import sys
 import time
 import json
+import hashlib
+import pickle
 import heapq
 import numpy as np
 import pyarrow.parquet as pq
@@ -35,6 +37,30 @@ BIN_DEG = 0.5
 N_BINS = int(360.0 / BIN_DEG)
 CHUNK = 8000
 TOP_KEEP = 50
+CKPT_DIR = ROOT / "data" / "eval_ckpt"
+
+
+def _ckpt(extra=""):
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    tag = hashlib.md5(extra.encode()).hexdigest()[:8] if extra else "default"
+    return CKPT_DIR / f"conf_eval_p3_{tag}.pkl"
+
+
+def _save_ckpt(path, data):
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.rename(path)
+    mb = path.stat().st_size / (1024 * 1024)
+    print(f"  [CKPT] Saved ({mb:.1f}MB): {path.name}")
+
+
+def _load_ckpt(path):
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    mb = path.stat().st_size / (1024 * 1024)
+    print(f"  [RESUME] Loaded ({mb:.1f}MB): {path.name}")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +316,14 @@ def evaluate_from_state(pano_id, state, coverage, n_crops, compute_err_fn):
 # ---------------------------------------------------------------------------
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from checkpoints if available")
+    ap.add_argument("--fresh", action="store_true",
+                    help="Ignore all checkpoints, run from scratch")
+    args = ap.parse_args()
+
     print("=" * 72)
     print("CONFIDENCE-GATED MULTI-PHOTO EVALUATOR V5")
     print("=" * 72)
@@ -372,9 +406,24 @@ def main():
             print(f"  KDTree unavailable ({e}) — ranks will be skipped\n")
     del have_truth, truth
 
-    # Phase 3: single-pass scan
-    states = [prepared[pid][0] for pid in pano_ids]
-    run_scan(states, pano_ids, true_rows)
+    # Phase 3: single-pass scan (with checkpoint)
+    ck = _ckpt(f"{len(pano_ids)}")
+    scan_done = False
+    if args.resume and ck.exists() and not args.fresh:
+        try:
+            ck_data = _load_ckpt(ck)
+            prepared = ck_data["prepared"]
+            pano_ids = ck_data["pano_ids"]
+            true_rows = ck_data["true_rows"]
+            print(f"  [RESUME] DB scan cached ({len(pano_ids)} panos) \u2014 skipping")
+            scan_done = True
+        except Exception as e:
+            print(f"  [RESUME] Cache corrupt ({e}) \u2014 re-running")
+
+    if not scan_done:
+        states = [prepared[pid][0] for pid in pano_ids]
+        run_scan(states, pano_ids, true_rows)
+        _save_ckpt(ck, {"prepared": prepared, "pano_ids": pano_ids, "true_rows": true_rows})
 
     # Phase 4: evaluate + report
     print()

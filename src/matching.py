@@ -651,18 +651,22 @@ def score_chunk_shared_fft(states_list, db_chunk, lats, lons, row_start,
             else:
                 continue
 
-            best_j = int(np.argmax(cb))
-            best_score = float(cb[0, best_j])
-            best_row = row_start + best_j
-            best_lat = float(lats[best_j])
-            best_lon = float(lons[best_j])
+            # cb shape: (N_DB, N_BINS) — correlation at every offset for every DB row
+            # Decode flat argmax into (row, offset)
+            flat_idx = int(np.argmax(cb))
+            best_row_local = flat_idx // N_BINS
+            best_offset = flat_idx % N_BINS
+            best_score = float(cb[best_row_local, best_offset])
+            best_row = row_start + best_row_local
+            best_lat = float(lats[best_row_local])
+            best_lon = float(lons[best_row_local])
 
-            # Collect top-K for RRF
-            flat = cb[0]
-            top_k = min(50, len(flat))
-            idx = np.argpartition(-flat, top_k)[:top_k]
-            idx = idx[np.argsort(-flat[idx])]
-            heap = [(float(flat[i]), row_start + int(i),
+            # Collect top-K for RRF: best score per DB row (across all offsets)
+            row_best = np.max(cb, axis=1)  # (N_DB,)
+            top_k = min(50, len(row_best))
+            idx = np.argpartition(-row_best, top_k)[:top_k]
+            idx = idx[np.argsort(-row_best[idx])]
+            heap = [(float(row_best[i]), row_start + int(i),
                      float(lats[i]), float(lons[i])) for i in idx]
 
             res[scorer] = {
