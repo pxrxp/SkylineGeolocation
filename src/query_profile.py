@@ -32,6 +32,31 @@ def is_profile_applicable(profile, min_std_deg=1.5, min_max_elev_deg=1.0):
     return True, "Valid topographic profile"
 
 
+def mask_to_boundary(mask_gray):
+    """Extract skyline row from a binary sky mask (sky=0, terrain=255).
+
+    Parameters
+    ----------
+    mask_gray : ndarray (H, W) uint8
+        Binary mask with sky=0, terrain=255 convention.
+
+    Returns
+    -------
+    boundary : ndarray (W,) float64
+        Row index of the first terrain pixel per column, or -1 if no terrain.
+    """
+    mask_gray = np.asarray(mask_gray, dtype=np.uint8)
+    if mask_gray.ndim != 2:
+        raise ValueError(f"Expected 2-D mask, got shape {mask_gray.shape}")
+    h, w = mask_gray.shape
+    bnd = np.full(w, -1.0)
+    for c in range(w):
+        terrain = np.where(mask_gray[:, c] > 127)[0]
+        if len(terrain) > 0:
+            bnd[c] = float(terrain[0])
+    return bnd
+
+
 def _subpixel_edge_from_image(gray, skyline_px, half_window=3):
     """Parabolic sub-pixel edge fitting on image gradient.
 

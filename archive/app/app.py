@@ -222,7 +222,7 @@ def main():
 
     if uploaded:
         img = Image.open(uploaded).convert("RGB")
-        st.image(img, caption="Uploaded photo", use_container_width=True)
+        st.image(img, caption="Uploaded photo", width="stretch")
 
         model = load_model()
         with st.spinner("Segmenting sky → extracting profile → matching..."):
@@ -273,7 +273,7 @@ def main():
                         "Offset (°)", format="%.1f"
                     ),
                 },
-                use_container_width=True,
+                width="stretch",
             )
 
         st.divider()

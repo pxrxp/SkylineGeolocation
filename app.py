@@ -10,6 +10,7 @@ import streamlit as st
 from PIL import Image
 import pyarrow.parquet as pq
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -43,9 +44,12 @@ def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2
-         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
-         * math.sin(dlon / 2) ** 2)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
@@ -102,8 +106,9 @@ def _get_db_profile(idx):
     return np.zeros(N_BINS)
 
 
-def _match_single_profile(profile, db_bin_deg, compass_deg=None, elevation_m=None,
-                          top_k=5):
+def _match_single_profile(
+    profile, db_bin_deg, compass_deg=None, elevation_m=None, top_k=5
+):
     """Match a single profile against the database using NCC."""
     t0 = time.time()
     timing = {}
@@ -122,19 +127,24 @@ def _match_single_profile(profile, db_bin_deg, compass_deg=None, elevation_m=Non
     chunk_start = 0
     for batch in pf.iter_batches(batch_size=CHUNK, columns=["raw_horizon_deg"]):
         chunk_df = batch.to_pandas()
-        chunk_matrix = np.stack(chunk_df["raw_horizon_deg"].to_numpy()).astype(np.float64)
+        chunk_matrix = np.stack(chunk_df["raw_horizon_deg"].to_numpy()).astype(
+            np.float64
+        )
         n_chunk = len(chunk_matrix)
 
         db_val, db_d1 = feature_bundle_matrix(chunk_matrix)
         corr, offsets = ncc_scores(
-            db_val, db_d1, profile, db_bin_deg,
+            db_val,
+            db_d1,
+            profile,
+            db_bin_deg,
             weights=(0.5, 0.5),
             expected_offset_deg=expected_offset,
             tolerance_deg=20.0,
         )
 
         if elevation_m is not None:
-            chunk_elev = db_meta["elev"][chunk_start:chunk_start + n_chunk]
+            chunk_elev = db_meta["elev"][chunk_start : chunk_start + n_chunk]
             elev_valid = np.abs(chunk_elev - elevation_m) <= 200.0
             corr = np.where(elev_valid, corr, -np.inf)
 
@@ -160,13 +170,15 @@ def _match_single_profile(profile, db_bin_deg, compass_deg=None, elevation_m=Non
         if best_corrs[i] == -np.inf:
             continue
         idx = best_indices[i]
-        matches.append({
-            "lat": float(db_meta["lat"][idx]),
-            "lon": float(db_meta["lon"][idx]),
-            "elev": float(db_meta["elev"][idx]),
-            "score": float(best_corrs[i]),
-            "offset_deg": float(best_offsets[i] * db_bin_deg),
-        })
+        matches.append(
+            {
+                "lat": float(db_meta["lat"][idx]),
+                "lon": float(db_meta["lon"][idx]),
+                "elev": float(db_meta["elev"][idx]),
+                "score": float(best_corrs[i]),
+                "offset_deg": float(best_offsets[i] * db_bin_deg),
+            }
+        )
 
     return matches, timing
 
@@ -182,8 +194,11 @@ def localize_single(image_path, model, compass_deg=None, elevation_m=None):
 
     if not seg["ok"]:
         return {
-            "ok": False, "status": seg["status"], "reason": seg["reason"],
-            "timing": timing, "diagnostics": seg.get("diagnostics", {}),
+            "ok": False,
+            "status": seg["status"],
+            "reason": seg["reason"],
+            "timing": timing,
+            "diagnostics": seg.get("diagnostics", {}),
         }
 
     t1 = time.time()
@@ -193,7 +208,9 @@ def localize_single(image_path, model, compass_deg=None, elevation_m=None):
 
     if not pr["ok"]:
         return {
-            "ok": False, "status": pr["status"], "reason": pr["reason"],
+            "ok": False,
+            "status": pr["status"],
+            "reason": pr["reason"],
             "timing": timing,
             "diagnostics": {**seg.get("diagnostics", {}), **pr.get("diagnostics", {})},
         }
@@ -202,7 +219,9 @@ def localize_single(image_path, model, compass_deg=None, elevation_m=None):
     ok, msg = is_profile_applicable(profile)
     if not ok:
         return {
-            "ok": False, "status": "NO_SKYLINE", "reason": msg,
+            "ok": False,
+            "status": "NO_SKYLINE",
+            "reason": msg,
             "timing": timing,
             "diagnostics": {**seg.get("diagnostics", {}), **pr.get("diagnostics", {})},
         }
@@ -214,8 +233,11 @@ def localize_single(image_path, model, compass_deg=None, elevation_m=None):
 
     if not matches:
         return {
-            "ok": False, "status": "NO_MATCH", "reason": "No candidates found",
-            "timing": timing, "diagnostics": seg.get("diagnostics", {}),
+            "ok": False,
+            "status": "NO_MATCH",
+            "reason": "No candidates found",
+            "timing": timing,
+            "diagnostics": seg.get("diagnostics", {}),
         }
 
     best_idx = int(np.argmax([m["score"] for m in matches]))
@@ -229,16 +251,21 @@ def localize_single(image_path, model, compass_deg=None, elevation_m=None):
         "ok": True,
         "status": "OK" if confident else "LOW_CONFIDENCE",
         "matches": matches,
-        "best_lat": best["lat"], "best_lon": best["lon"],
-        "best_score": best["score"], "score_gap": gap,
-        "confident": confident, "timing": timing,
+        "best_lat": best["lat"],
+        "best_lon": best["lon"],
+        "best_score": best["score"],
+        "score_gap": gap,
+        "confident": confident,
+        "timing": timing,
         "diagnostics": {**seg.get("diagnostics", {}), **pr.get("diagnostics", {})},
-        "query_profile": profile, "db_profile": db_profile,
+        "query_profile": profile,
+        "db_profile": db_profile,
         "db_bin_deg": db_bin_deg,
     }
 
 
 # ── Multi-crop demo (cached) ─────────────────────────────────────────────
+
 
 def _load_cached_multicrop():
     """Load pre-computed multi-crop demo result."""
@@ -260,14 +287,18 @@ def _load_cached_multicrop():
                 meta = json.load(f)
             if not isinstance(meta, dict):
                 continue
-            if (meta.get("pano_id") == cache["pano_id"]
-                    and abs(meta.get("heading_deg", 0) - cd["heading"]) < 1):
+            if (
+                meta.get("pano_id") == cache["pano_id"]
+                and abs(meta.get("heading_deg", 0) - cd["heading"]) < 1
+            ):
                 img_path = os.path.join(CROPS_DIR, meta["filename"])
                 break
         if img_path and os.path.exists(img_path):
             crop_images.append(Image.open(img_path).convert("RGB"))
             # Try to find mask (same name but in masks dir or _mask suffix)
-            mask_path = img_path.replace("/gsv_crops/", "/gsv_masks/").replace(".png", "_mask.png")
+            mask_path = img_path.replace("/gsv_crops/", "/gsv_masks/").replace(
+                ".png", "_mask.png"
+            )
             if not os.path.exists(mask_path):
                 mask_path = img_path.replace(".png", "_mask.png")
             if os.path.exists(mask_path):
@@ -312,8 +343,11 @@ def display_cached_multicrop(cache):
     # Find which NCC match is closest to true location
     if matches and true_lat:
         from geopy.distance import geodesic
-        best_ncc = min(matches, key=lambda m: geodesic(
-            (true_lat, true_lon), (m["lat"], m["lon"])).meters)
+
+        best_ncc = min(
+            matches,
+            key=lambda m: geodesic((true_lat, true_lon), (m["lat"], m["lon"])).meters,
+        )
     else:
         best_ncc = best
 
@@ -332,9 +366,7 @@ def display_cached_multicrop(cache):
 
     # Status
     if rrf_err_display is not None and rrf_err_display < 1000:
-        st.success(
-            f"**Location found** — {rrf_err_display:.0f} m from true position"
-        )
+        st.success(f"**Location found** — {rrf_err_display:.0f} m from true position")
     else:
         st.warning("**Low confidence** — result may be unreliable")
 
@@ -371,23 +403,24 @@ def display_cached_multicrop(cache):
                 # Overlay mask if available
                 if mask is not None:
                     img_np = np.array(display_img)
-                    mask_np = np.array(mask.resize(
-                        (img_np.shape[1], img_np.shape[0]), Image.NEAREST
-                    ))
+                    mask_np = np.array(
+                        mask.resize((img_np.shape[1], img_np.shape[0]), Image.NEAREST)
+                    )
                     overlay = img_np.copy()
                     sky = mask_np < 128
                     overlay[sky] = (
-                        overlay[sky] * 0.4
-                        + np.array([100, 150, 255]) * 0.6
+                        overlay[sky] * 0.4 + np.array([100, 150, 255]) * 0.6
                     ).astype(np.uint8)
-                    st.image(overlay, use_container_width=False)
+                    st.image(overlay, width="content")
                 else:
-                    st.image(display_img, use_container_width=False)
+                    st.image(display_img, width="content")
 
     # Individual profiles → fused profile
     st.markdown("**Individual crop profiles → fused**")
     n_crops = len(crop_data)
-    fig, axes = plt.subplots(1, n_crops + 1, figsize=(2.5 * (n_crops + 1), 2), sharey=True)
+    fig, axes = plt.subplots(
+        1, n_crops + 1, figsize=(2.5 * (n_crops + 1), 2), sharey=True
+    )
     colors = ["#E53935", "#1E88E5", "#43A047"]
     for i, cd in enumerate(crop_data):
         ax = axes[i]
@@ -447,7 +480,9 @@ def display_cached_multicrop(cache):
         st.markdown(f"**{dist:.1f} km {dir_str} of {landmark}**")
         st.map(
             {"lat": [lat, llat], "lon": [lon, llon]},
-            zoom=11, width=400, height=250,
+            zoom=11,
+            width=400,
+            height=250,
         )
 
     # Top-5 candidates
@@ -461,7 +496,7 @@ def display_cached_multicrop(cache):
                 "score": st.column_config.NumberColumn("Score", format="%.4f"),
                 "offset_deg": st.column_config.NumberColumn("Offset", format="%.1f"),
             },
-            use_container_width=True,
+            width="stretch",
         )
 
     # Diagnostics
@@ -548,7 +583,9 @@ def display_single_result(result):
         st.markdown(f"**{dist:.1f} km {dir_str} of {landmark}**")
         st.map(
             {"lat": [lat, llat], "lon": [lon, llon]},
-            zoom=11, width=400, height=250,
+            zoom=11,
+            width=400,
+            height=250,
         )
 
     with st.expander("Top-5 Candidates"):
@@ -561,7 +598,7 @@ def display_single_result(result):
                 "score": st.column_config.NumberColumn("Score", format="%.4f"),
                 "offset_deg": st.column_config.NumberColumn("Offset", format="%.1f"),
             },
-            use_container_width=True,
+            width="stretch",
         )
 
     with st.expander("Timing & diagnostics"):
@@ -591,12 +628,20 @@ def main():
     with col_opts:
         st.subheader("Sensor Data (optional)")
         compass = st.number_input(
-            "Compass heading (°)", min_value=0.0, max_value=360.0,
-            value=None, placeholder="e.g. 170", step=1.0,
+            "Compass heading (°)",
+            min_value=0.0,
+            max_value=360.0,
+            value=None,
+            placeholder="e.g. 170",
+            step=1.0,
         )
         elevation = st.number_input(
-            "GPS altitude (m)", min_value=0.0, max_value=9000.0,
-            value=None, placeholder="e.g. 5200", step=1.0,
+            "GPS altitude (m)",
+            min_value=0.0,
+            max_value=9000.0,
+            value=None,
+            placeholder="e.g. 5200",
+            step=1.0,
         )
         st.caption(
             "Without sensors, matching searches all headings. "
@@ -625,13 +670,14 @@ def main():
         if img.width > max_w:
             ratio = max_w / img.width
             img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
-        st.image(img, caption="Uploaded photo", use_container_width=False)
+        st.image(img, caption="Uploaded photo", width="content")
 
         with st.spinner("Segmenting sky → extracting profile → matching..."):
             tmp_path = "/tmp/dashboard_upload.png"
             img.save(tmp_path)
             result = localize_single(
-                tmp_path, model,
+                tmp_path,
+                model,
                 compass_deg=compass if compass else None,
                 elevation_m=elevation if elevation else None,
             )

@@ -812,3 +812,67 @@ def train_sky_model(
             torch.save(model.state_dict(), str(save_path))
 
     return train_losses, val_losses, train_ious, val_ious, lrs
+
+
+def show_augmentation_samples(train_loader, n_cols=6):
+    """Visualize a batch of augmented training samples (images + masks side-by-side).
+
+    Parameters
+    ----------
+    train_loader : DataLoader
+        Training DataLoader (will grab one batch via next(iter(...))).
+    n_cols : int
+        Number of samples to display per row.
+    """
+    sample_imgs, sample_masks = next(iter(train_loader))
+    n_show = min(n_cols, sample_imgs.shape[0])
+    fig, axes = plt.subplots(2, n_show, figsize=(3 * n_show, 6))
+    if n_show == 1:
+        axes = axes.reshape(-1, 1)
+    for i in range(n_show):
+        img = sample_imgs[i].permute(1, 2, 0).cpu().numpy()
+        img = img * np.array(IMAGENET_STD) + np.array(IMAGENET_MEAN)
+        img = np.clip(img, 0, 1)
+        axes[0, i].imshow(img)
+        axes[0, i].set_title(f"Image {i + 1}")
+        axes[0, i].axis("off")
+        axes[1, i].imshow(sample_masks[i].squeeze().cpu(), cmap="gray")
+        axes[1, i].set_title(f"Mask {i + 1}")
+        axes[1, i].axis("off")
+    plt.suptitle("Augmented Training Samples", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_training_curves(train_losses, val_losses, train_ious, val_ious, lrs):
+    """Plot training loss, IoU, and learning-rate curves.
+
+    Parameters
+    ----------
+    train_losses, val_losses : list of float
+    train_ious, val_ious : list of float
+    lrs : list of float
+    """
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
+
+    ax1.plot(train_losses, label="Train")
+    ax1.plot(val_losses, label="Val")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.set_title("Loss")
+    ax1.legend()
+
+    ax2.plot(train_ious, label="Train")
+    ax2.plot(val_ious, label="Val")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("IoU")
+    ax2.set_title("IoU")
+    ax2.legend()
+
+    ax3.plot(lrs)
+    ax3.set_xlabel("Epoch")
+    ax3.set_ylabel("Learning Rate")
+    ax3.set_title("LR Schedule")
+
+    plt.tight_layout()
+    plt.show()
